@@ -117,6 +117,43 @@ class TotpBackupCodeItem(BaseModel):
 class TotpBackupCodesResponse(BaseModel):
     codes: list[TotpBackupCodeItem]
 
+EXTERNAL_LINK_PLACEHOLDERS = ("imdb_id", "tmdb_id", "tvdb_id", "type")
+MAX_EXTERNAL_LINKS = 20
+# Schemes that run or embed content in the page instead of navigating away.
+_BLOCKED_LINK_SCHEMES = {"javascript", "data", "vbscript", "file", "blob"}
+
+
+class ExternalLink(BaseModel):
+    """A custom badge on movie/show pages. url_template may use the
+    {imdb_id}, {tmdb_id}, {tvdb_id} and {type} placeholders; a link whose
+    placeholder has no value on a page is skipped there."""
+    label: str = Field(min_length=1, max_length=40)
+    url_template: str = Field(min_length=1, max_length=500)
+
+    @field_validator("label", "url_template", mode="before")
+    @classmethod
+    def strip(cls, value):
+        return value.strip() if isinstance(value, str) else value
+
+    @field_validator("url_template")
+    @classmethod
+    def check_template(cls, value: str) -> str:
+        # Any app scheme is fine (stremio://, plex://) - the link is the user's
+        # own - but never one that executes in Scrob's origin.
+        match = re.match(r"^([a-zA-Z][a-zA-Z0-9+.-]*):", value)
+        if not match:
+            raise ValueError("URL must start with a scheme, e.g. https:// or stremio://")
+        if match.group(1).lower() in _BLOCKED_LINK_SCHEMES:
+            raise ValueError(f"{match.group(1)}: links are not allowed")
+        unknown = set(re.findall(r"\{([^{}]*)\}", value)) - set(EXTERNAL_LINK_PLACEHOLDERS)
+        if unknown:
+            raise ValueError(
+                "Unknown placeholder " + ", ".join(f"{{{name}}}" for name in sorted(unknown))
+                + ". Use " + ", ".join(f"{{{name}}}" for name in EXTERNAL_LINK_PLACEHOLDERS) + "."
+            )
+        return value
+
+
 class UserSettings(BaseModel):
     tmdb_api_key: Optional[str] = None
     rpdb_api_key: Optional[str] = Field(default=None, max_length=255)
@@ -234,6 +271,7 @@ class UserSettings(BaseModel):
     rate_prompt_movies: Optional[bool] = None
     rate_prompt_episodes: Optional[bool] = None
     duplicate_watch_window_minutes: Optional[int] = Field(default=None, ge=0)
+    external_links: Optional[list[ExternalLink]] = Field(default=None, max_length=MAX_EXTERNAL_LINKS)
 
     @field_validator("rpdb_api_key", mode="before")
     @classmethod

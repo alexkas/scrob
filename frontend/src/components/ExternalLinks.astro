@@ -1,0 +1,23 @@
+---
+// The viewer's own external-link badges (Settings → External links),
+// rendered inline next to the built-in IMDb/TMDB/TVDB badges.
+import { resolveExternalLinks, type ExternalLinkIds } from "../lib/externalLinks";
+
+interface Props {
+  ids: ExternalLinkIds;
+}
+
+const { ids } = Astro.props;
+const links = resolveExternalLinks(Astro.locals.settings?.external_links, ids);
+---
+
+{links.map((link) => (
+  <a
+    href={link.href}
+    target={link.newTab ? "_blank" : undefined}
+    rel="noopener noreferrer"
+    class="px-2 py-0.5 bg-zinc-800 border border-zinc-700 rounded text-[10px] font-black text-zinc-300 tracking-widest hover:bg-zinc-700 hover:text-white transition-colors"
+  >
+    {link.label}
+  </a>
+))}

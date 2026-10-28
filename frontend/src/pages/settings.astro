@@ -399,6 +399,37 @@ try {
               ))}
             </div>
           </div>
+          <div class="p-4 bg-zinc-900/60 rounded-xl border border-zinc-800">
+            <p class="text-sm font-semibold text-zinc-100 mb-1">External links</p>
+            <p class="text-xs text-zinc-400">
+              Your own badges on movie and show pages, next to IMDb and TMDB. Placeholders:
+              <code class="text-zinc-300">{"{imdb_id}"}</code>, <code class="text-zinc-300">{"{tmdb_id}"}</code>,
+              <code class="text-zinc-300">{"{tvdb_id}"}</code> (shows only) and
+              <code class="text-zinc-300">{"{type}"}</code> (<code class="text-zinc-300">movie</code> or <code class="text-zinc-300">series</code>).
+              A link is hidden on pages missing one of its values.
+              Example: <code class="text-zinc-300 break-all">{"stremio:///detail/{type}/{imdb_id}"}</code>
+            </p>
+            <div id="external-links-list" class="space-y-2 mt-4">
+              {(settings.external_links ?? []).map((link) => (
+                <div class="external-link-row flex flex-col sm:flex-row gap-2">
+                  <input type="text" value={link.label} maxlength="40" placeholder="Label" aria-label="Label" class="external-link-label sm:w-40 bg-zinc-950 border border-zinc-800 rounded-lg px-3 py-2 text-sm text-zinc-100 focus:outline-none focus:ring-2 focus:ring-blue-500" />
+                  <input type="text" value={link.url_template} maxlength="500" placeholder="https://example.com/{imdb_id}" aria-label="URL template" class="external-link-url flex-1 min-w-0 bg-zinc-950 border border-zinc-800 rounded-lg px-3 py-2 text-sm text-zinc-100 font-mono focus:outline-none focus:ring-2 focus:ring-blue-500" />
+                  <button type="button" class="external-link-remove px-3 py-2 text-sm text-zinc-400 hover:text-red-400 border border-zinc-800 rounded-lg cursor-pointer transition-colors" aria-label="Remove link">Remove</button>
+                </div>
+              ))}
+            </div>
+            <template id="external-link-row-template">
+              <div class="external-link-row flex flex-col sm:flex-row gap-2">
+                <input type="text" maxlength="40" placeholder="Label" aria-label="Label" class="external-link-label sm:w-40 bg-zinc-950 border border-zinc-800 rounded-lg px-3 py-2 text-sm text-zinc-100 focus:outline-none focus:ring-2 focus:ring-blue-500" />
+                <input type="text" maxlength="500" placeholder="https://example.com/{imdb_id}" aria-label="URL template" class="external-link-url flex-1 min-w-0 bg-zinc-950 border border-zinc-800 rounded-lg px-3 py-2 text-sm text-zinc-100 font-mono focus:outline-none focus:ring-2 focus:ring-blue-500" />
+                <button type="button" class="external-link-remove px-3 py-2 text-sm text-zinc-400 hover:text-red-400 border border-zinc-800 rounded-lg cursor-pointer transition-colors" aria-label="Remove link">Remove</button>
+              </div>
+            </template>
+            <div class="flex gap-2 mt-3">
+              <button type="button" id="external-link-add" class="px-3 py-2 text-sm bg-zinc-800 hover:bg-zinc-700 border border-zinc-700 text-zinc-300 rounded-lg cursor-pointer transition-colors">Add link</button>
+              <button type="button" id="external-links-save" class="px-3 py-2 text-sm bg-blue-600 hover:bg-blue-500 text-white font-semibold rounded-lg cursor-pointer transition-colors disabled:opacity-50">Save links</button>
+            </div>
+          </div>
         </div>
       </section>
 
@@ -2082,6 +2113,55 @@ try {
         headers: { 'Authorization': `Bearer ${tok}`, 'Content-Type': 'application/json' },
         body: JSON.stringify({ use_hls_player: hlsPlayerToggle.checked }),
       });
+    });
+  }
+
+  const externalLinksList = document.getElementById('external-links-list');
+  const externalLinkTemplate = document.getElementById('external-link-row-template') as HTMLTemplateElement | null;
+  const externalLinksSave = document.getElementById('external-links-save') as HTMLButtonElement | null;
+  if (externalLinksList && externalLinkTemplate && externalLinksSave) {
+    externalLinksList.addEventListener('click', (e) => {
+      (e.target as HTMLElement).closest('.external-link-remove')?.closest('.external-link-row')?.remove();
+    });
+    document.getElementById('external-link-add')?.addEventListener('click', () => {
+      externalLinksList.appendChild(externalLinkTemplate.content.cloneNode(true));
+      (externalLinksList.lastElementChild?.querySelector('.external-link-label') as HTMLInputElement | null)?.focus();
+    });
+    externalLinksSave.addEventListener('click', async () => {
+      // Fully blank rows are dropped; half-filled ones go to the backend to be rejected.
+      const links = [...externalLinksList.querySelectorAll('.external-link-row')]
+        .map((row) => ({
+          label: (row.querySelector('.external-link-label') as HTMLInputElement).value.trim(),
+          url_template: (row.querySelector('.external-link-url') as HTMLInputElement).value.trim(),
+        }))
+        .filter((link) => link.label || link.url_template);
+      const tok = (document.getElementById('app-data') as HTMLElement | null)?.dataset.token ?? '';
+      externalLinksSave.disabled = true;
+      try {
+        const res = await fetch('/api/proxy/auth/settings', {
+          method: 'PATCH',
+          headers: { 'Authorization': `Bearer ${tok}`, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ external_links: links }),
+        });
+        if (res.ok) {
+          showMessage('External links saved');
+          return;
+        }
+        const body = await res.json().catch(() => null);
+        // FastAPI validation errors arrive as a list; loc ends [..., index, field].
+        const detail = Array.isArray(body?.detail)
+          ? body.detail.map((d: any) => {
+              const index = d.loc?.find((part: unknown) => typeof part === 'number');
+              const msg = String(d.msg ?? '').replace(/^Value error, /, '');
+              return index != null ? `Link ${index + 1}: ${msg}` : msg;
+            }).join('\n')
+          : body?.detail;
+        showMessage(detail || 'Could not save external links', 'error');
+      } catch {
+        showMessage('Could not save external links', 'error');
+      } finally {
+        externalLinksSave.disabled = false;
+      }
     });
   }
   setupExportData();

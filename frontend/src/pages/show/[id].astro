@@ -8,6 +8,7 @@ import TraktCommentsSection from "../../components/TraktCommentsSection.astro";
 import CastCrewSection from "../../components/CastCrewSection.astro";
 import EpisodeOrderSelector from "../../components/EpisodeOrderSelector.astro";
 import RatingHeatmap from "../../components/RatingHeatmap.astro";
+import ExternalLinks from "../../components/ExternalLinks.astro";
 import { api, type Show } from "../../lib/api";
 import { countAiredRegularSeasons } from "../../lib/seasonCount";
 import { ratingPosterUrl } from "../../lib/posters";
@@ -172,6 +173,7 @@ const posterPath = show
                     TVDB
                   </a>
                 )}
+                <ExternalLinks ids={{ imdb_id: show.imdb_id, tmdb_id: show.tmdb_id, tvdb_id: show.tvdb_id, type: "series" }} />
                 {show.status && (
                   <span class="capitalize px-2 py-0.5 bg-zinc-800 border border-zinc-700 rounded text-[10px] font-black text-zinc-400 tracking-widest">
                     {show.status}

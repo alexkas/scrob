@@ -10,6 +10,7 @@ import CastCrewSection from "../../../components/CastCrewSection.astro";
 import VideoPlayer from "../../../components/VideoPlayer.astro";
 import ManualScrobble from "../../../components/ManualScrobble.astro";
 import TrailerButton from "../../../components/TrailerButton.astro";
+import ExternalLinks from "../../../components/ExternalLinks.astro";
 import { api, type MediaItem } from "../../../lib/api";
 import { ratingPosterUrl } from "../../../lib/posters";
 export const prerender = false;
@@ -184,6 +185,9 @@ const lastWatchedLabel = formatWatchedOn(item?.last_watched_at, getViewerTimeZon
                   <a href={`https://www.themoviedb.org/${isMovie ? "movie" : "tv"}/${item.tmdb_id}`} target="_blank" rel="noopener noreferrer" class="px-2 py-0.5 bg-[#01b4e4] rounded text-[10px] font-black text-black tracking-widest hover:bg-[#0aa0cb] transition-colors">
                     TMDB
                   </a>
+                )}
+                {isMovie && (
+                  <ExternalLinks ids={{ imdb_id: item.imdb_id, tmdb_id: item.tmdb_id, type: "movie" }} />
                 )}
                 {item.status && (
                   isMovie ? (

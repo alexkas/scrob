@@ -1,3 +1,5 @@
+import type { ExternalLink } from "./externalLinks";
+
 const BACKEND_PORT = (import.meta.env.BACKEND_PORT as string | undefined) ?? "7331";
 const BASE = `http://localhost:${BACKEND_PORT}`;
 
@@ -551,6 +553,7 @@ export interface UserSettings {
   rate_prompt_episodes: boolean;
   duplicate_watch_window_minutes: number | null;
   condense_history_by_show: boolean;
+  external_links: ExternalLink[] | null;
 }
 
 export interface MediaServerConnection {
