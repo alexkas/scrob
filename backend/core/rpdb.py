@@ -4,7 +4,14 @@ from urllib.parse import quote
 
 import httpx
 
+from core.config import settings
+
 MAX_API_KEY_LENGTH = 255
+
+
+def base_url() -> str:
+    """RPDB_BASE_URL without a trailing slash."""
+    return settings.rpdb_base_url.rstrip("/")
 
 
 def normalize_api_key(key: str | None) -> str | None:
@@ -23,7 +30,7 @@ async def validate_api_key(key: str | None) -> bool:
             return False
         async with httpx.AsyncClient(timeout=10.0, follow_redirects=False) as client:
             response = await client.get(
-                f"https://api.ratingposterdb.com/{quote(key, safe='')}/isValid"
+                f"{base_url()}/{quote(key, safe='')}/isValid"
             )
             response.raise_for_status()
             data = response.json()

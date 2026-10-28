@@ -354,6 +354,8 @@ Choose poster styles and rating sources in the [RPDB manager](https://manager.ra
 
 Rating posters are fetched server-side through the same image proxy as TMDB and TheTVDB artwork, so your key stays on the server and is never placed in the page. It is not written into shared media metadata, and data exports include it only when you explicitly select **API Keys**. Existing metadata and the server's image cache are unchanged.
 
+To use a self-hosted RPDB-compatible server such as OpenPosterDB instead, set `RPDB_BASE_URL` (default `https://api.ratingposterdb.com`), e.g. `RPDB_BASE_URL: http://openposterdb:3000`. The server must answer `/{key}/isValid` with `{"valid": true}` and serve `/{key}/{provider}/poster-default/{id}.jpg`. Key validation and posters both use it.
+
 ## ARVIO Cloud Synchronization
 
 Scrob supports pull synchronization from **ARVIO Cloud** (`https://auth.arvio.tv/.netlify/functions`), importing watched movies, watched episodes, and continue watching playback progress per profile.

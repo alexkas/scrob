@@ -97,6 +97,11 @@ class Settings(BaseSettings):
             f"@{self.postgres_host}:{self.postgres_port}/{self.postgres_db}"
         )
 
+    # RatingPosterDB API host. Point it at an RPDB-compatible server (e.g.
+    # OpenPosterDB) that serves /{key}/isValid and
+    # /{key}/{provider}/poster-default/{id}.jpg in the same shape.
+    rpdb_base_url: str = "https://api.ratingposterdb.com"
+
     # File storage root — override with DATA_DIR env var in production / Docker
     data_dir: Path = Path(__file__).parent.parent / "data"
 

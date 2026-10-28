@@ -6139,7 +6139,7 @@ async def serve_rating_poster(
         select(UserSettings).where(UserSettings.user_id == user_id)
     )).scalar_one_or_none()
 
-    from core.rpdb import normalize_api_key
+    from core.rpdb import base_url, normalize_api_key
     try:
         key = normalize_api_key(settings_row.rpdb_api_key) if settings_row else None
     except ValueError:
@@ -6148,7 +6148,7 @@ async def serve_rating_poster(
         return _to_fallback()
 
     url = (
-        f"https://api.ratingposterdb.com/{urllib.parse.quote(key, safe='')}"
+        f"{base_url()}/{urllib.parse.quote(key, safe='')}"
         f"/{provider}/poster-default/{rpdb_id}.jpg?fallback=true"
     )
     try:

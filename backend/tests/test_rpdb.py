@@ -52,6 +52,19 @@ class RpdbProviderTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(await rpdb.validate_api_key("  key/evil?x=#fragment  "))
         self.assertEqual(str(seen[0]), "https://api.ratingposterdb.com/key%2Fevil%3Fx%3D%23fragment/isValid")
 
+    async def test_rpdb_base_url_overrides_the_validation_host(self):
+        seen = []
+        def respond(request):
+            seen.append(request.url)
+            return httpx.Response(200, json={"valid": True})
+        client = httpx.AsyncClient(transport=httpx.MockTransport(respond))
+        with (
+            patch.object(rpdb.settings, "rpdb_base_url", "http://openposterdb:3000/"),
+            patch.object(rpdb.httpx, "AsyncClient", return_value=client),
+        ):
+            self.assertTrue(await rpdb.validate_api_key("key"))
+        self.assertEqual(str(seen[0]), "http://openposterdb:3000/key/isValid")
+
 
 class RpdbSettingsTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
@@ -189,6 +202,27 @@ class ServeRatingPosterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(r.headers["content-type"], "image/jpeg")
         sent = client.get.call_args[0][0]
         self.assertIn("api.ratingposterdb.com/secret-key/tmdb/poster-default/movie-603.jpg", sent)
+
+    async def test_rpdb_base_url_overrides_the_poster_host(self):
+        img = httpx.Response(200, content=b"\xff\xd8jpegbytes", headers={"content-type": "image/jpeg"},
+                             request=httpx.Request("GET", "http://openposterdb:3000/x"))
+        import httpx as _h
+        client = AsyncMock()
+        client.get.return_value = img
+        with (
+            patch.object(rpdb.settings, "rpdb_base_url", "http://openposterdb:3000"),
+            patch.object(_h, "AsyncClient") as factory,
+        ):
+            factory.return_value.__aenter__.return_value = client
+            r = await self.client.get(
+                "/media/rating-poster/tmdb/movie-603",
+                params={"fallback": "/api/proxy/media/image/w500/x.jpg"},
+            )
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(
+            client.get.call_args[0][0],
+            "http://openposterdb:3000/secret-key/tmdb/poster-default/movie-603.jpg?fallback=true",
+        )
 
     async def test_rpdb_failure_redirects_to_the_fallback(self):
         import httpx as _h
