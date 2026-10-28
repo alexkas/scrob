@@ -570,18 +570,31 @@ const sonarrUrl = `${origin}/api/proxy/sonarr-compat/${list?.id}`;
   let activeItemsFilter = 'all';
   const itemsFilterEmpty = document.getElementById('items-filter-empty');
 
-  document.querySelectorAll('.items-filter-btn').forEach(btn => {
-    btn.addEventListener('click', () => {
-      activeItemsFilter = btn.getAttribute('data-items-filter');
-      document.querySelectorAll('.items-filter-btn').forEach(b => {
-        const isActive = b.getAttribute('data-items-filter') === activeItemsFilter;
-        b.classList.toggle('bg-zinc-800', isActive);
-        b.classList.toggle('text-zinc-100', isActive);
-        b.classList.toggle('text-zinc-500', !isActive);
-      });
-      applyItemsFilter();
+  // Kept in the URL (?type=) so it survives the reload a show/season-level
+  // collect does, and links to a filtered list stay filtered.
+  function setItemsFilter(value) {
+    activeItemsFilter = value;
+    document.querySelectorAll('.items-filter-btn').forEach(b => {
+      const isActive = b.getAttribute('data-items-filter') === activeItemsFilter;
+      b.classList.toggle('bg-zinc-800', isActive);
+      b.classList.toggle('text-zinc-100', isActive);
+      b.classList.toggle('text-zinc-500', !isActive);
     });
+    applyItemsFilter();
+    const url = new URL(window.location.href);
+    if (value === 'all') url.searchParams.delete('type');
+    else url.searchParams.set('type', value);
+    history.replaceState(history.state, '', url);
+  }
+
+  document.querySelectorAll('.items-filter-btn').forEach(btn => {
+    btn.addEventListener('click', () => setItemsFilter(btn.getAttribute('data-items-filter')));
   });
+
+  const initialItemsFilter = new URLSearchParams(window.location.search).get('type');
+  if (initialItemsFilter && document.querySelector(`.items-filter-btn[data-items-filter="${CSS.escape(initialItemsFilter)}"]`)) {
+    setItemsFilter(initialItemsFilter);
+  }
 
   function applyItemsFilter() {
     const grid = document.getElementById('items-grid');

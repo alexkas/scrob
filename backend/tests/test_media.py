@@ -413,3 +413,53 @@ class UncollectShowSeriesLevelTests(_CollectionDB):
             remaining = (await db.execute(_sa_select(Collection.media_id))).scalars().all()
 
         self.assertEqual(remaining, [])
+
+
+class _sqlite_insert:
+    """Stands in for postgresql.insert: manually_collect's ON CONFLICT names a
+    Postgres constraint, which SQLite's on_conflict_do_nothing doesn't take."""
+
+    def __init__(self, table):
+        from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+
+        self.stmt = sqlite_insert(table)
+
+    def values(self, **kw):
+        self.stmt = self.stmt.values(**kw)
+        return self
+
+    def on_conflict_do_nothing(self, **_kw):
+        return self.stmt.on_conflict_do_nothing()
+
+
+class CollectSeriesLevelTests(_CollectionDB):
+    """Collecting a show from its card/page adds a series-level entry, as
+    Stremio library sync does, instead of collecting every episode."""
+
+    async def test_collect_series_creates_series_row_without_episodes(self) -> None:
+        async with self.Session() as db:
+            push = AsyncMock()
+            sync_shows = AsyncMock(return_value=({}, {}))
+            with (
+                patch("sqlalchemy.dialects.postgresql.insert", _sqlite_insert),
+                patch.object(media_router, "get_user_tmdb_key", AsyncMock(return_value="key")),
+                patch.object(media_router.tmdb, "get_show", AsyncMock(return_value={"name": "Cape Fear"})),
+                patch("core.enrichment.enrich_media", AsyncMock()),
+                patch("routers.sync.sync_shows_batch", sync_shows),
+                patch.object(media_router, "_push_collection_change", push),
+            ):
+                result = await media_router.manually_collect(
+                    media_router.CollectRequest(tmdb_id=800, media_type=MediaType.series),
+                    db=db, current_user=SimpleNamespace(id=7),
+                )
+
+            media_rows = (await db.execute(_sa_select(Media))).scalars().all()
+            collected = (await db.execute(_sa_select(Collection.media_id))).scalars().all()
+
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual([(m.tmdb_id, m.media_type) for m in media_rows], [(800, MediaType.series)])
+        self.assertEqual(collected, [media_rows[0].id])
+        sync_shows.assert_awaited_once()
+        self.assertEqual(sync_shows.await_args.args[0], {"800": 800})
+        self.assertEqual(push.await_args.args[2], {media_rows[0].id})
+        self.assertEqual(push.await_args.kwargs, {"added": True})

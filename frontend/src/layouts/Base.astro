@@ -2413,13 +2413,15 @@ const bottomNavItem = (active: boolean) =>
         const seriesId = showTmdbId || tmdbId;
         try {
           if (mediaType === 'series' && !season) {
-            // Show-level collect/uncollect — covers all seasons
+            // Show-level collect adds the show itself (a series-level entry, as
+            // Stremio library sync does) without collecting any episodes;
+            // uncollect removes that entry and every collected episode.
             if (inLibrary) {
-              const ok = await showConfirm('Remove show from collection?', 'This will remove all collection entries for every episode in this show.');
+              const ok = await showConfirm('Remove show from collection?', 'This will remove the show and any collected episodes from your collection.');
               if (!ok) return;
               await apiFetch(`/media/collect-show?tmdb_id=${tmdbId}`, 'DELETE');
             } else {
-              await apiFetch('/media/collect-show', 'POST', { tmdb_id: Number(tmdbId), media_type: 'series' });
+              await apiFetch('/media/collect', 'POST', { tmdb_id: Number(tmdbId), media_type: 'series' });
             }
           } else if (mediaType === 'series' && season) {
             // Season-level collect/uncollect

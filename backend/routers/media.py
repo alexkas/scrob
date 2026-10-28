@@ -3264,12 +3264,24 @@ async def manually_collect(
                     show_id=show.id,
                 )
                 media = await enrich_media_safely(db, media, api_key=tmdb_key, series_tmdb_id=body.series_tmdb_id)
+            elif body.media_type == MediaType.series:
+                # A series-level entry, as Stremio library sync creates - the
+                # show is in the collection without any of its episodes.
+                data = await tmdb.get_show(body.tmdb_id, api_key=tmdb_key)
+                media, _created = await create_media_safely(db, body.tmdb_id, body.media_type, title=data.get("name", ""))
+                await enrich_media(media, api_key=tmdb_key)
             else:
                 raise HTTPException(status_code=400, detail=f"Manual collection not supported for type: {body.media_type}")
         except HTTPException:
             raise
         except Exception as e:
             raise HTTPException(status_code=404, detail=f"TMDB lookup failed: {e}")
+
+    # The shows collection (routers/shows.py list_shows) lists Show rows, so a
+    # series-level entry needs one - same as a Stremio-synced show gets.
+    if media.media_type == MediaType.series and media.tmdb_id and check_tmdb_key(tmdb_key):
+        from routers.sync import sync_shows_batch
+        await sync_shows_batch({str(media.tmdb_id): media.tmdb_id}, db, api_key=tmdb_key)
 
     # Check for existing collection entry
     existing_q = await db.execute(
