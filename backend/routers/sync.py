@@ -7086,10 +7086,23 @@ async def _push_stremio_connection(
                 if poster != candidate.get("poster"):
                     candidates[content_id] = {**candidate, "poster": poster}
 
+        # Stremio orders Continue Watching and the library by _mtime, so only
+        # viewing activity moves an item to "now". Library flags and posters
+        # step the existing _mtime by 1 ms: newer, so other clients still pull
+        # the change, without reshuffling the rows.
+        activity_ids = {
+            str(record["content_id"]) for record in [*watched_records, *progress_records]
+        }
         changes = []
         for content_id, candidate in candidates.items():
-            candidate["_mtime"] = now
             existing = remote_by_id.get(content_id)
+            existing_ms = _stremio_epoch_ms(existing.get("_mtime")) if existing else None
+            if content_id in activity_ids or existing_ms is None:
+                candidate["_mtime"] = now
+            else:
+                candidate["_mtime"] = datetime.fromtimestamp(
+                    (existing_ms + 1) / 1000, tz=timezone.utc
+                ).isoformat(timespec="milliseconds").replace("+00:00", "Z")
             if existing is None or not _stremio_same_item(existing, candidate):
                 changes.append(candidate)
         for start in range(0, len(changes), BATCH_SIZE):

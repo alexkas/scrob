@@ -828,6 +828,46 @@ class StremioSyncTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(pushed["state"]["timeOffset"], 120_000)
         self.assertEqual(pushed["state"]["duration"], 600_000)
 
+    async def test_progress_push_moves_item_to_now(self) -> None:
+        connection = SimpleNamespace(
+            id=49,
+            token="auth-key",
+            push_collection=False,
+            push_watched=False,
+            push_playback=True,
+            stremio_pushed_library_ids=None,
+        )
+        progress = {
+            "content_id": "tt0133093",
+            "content_type": "movie",
+            "title": "The Matrix",
+            "position": 120_000,
+            "duration": 600_000,
+            "last_watched": None,
+        }
+        datastore_put = AsyncMock()
+        with (
+            patch(
+                "routers.sync._build_nuvio_progress_items",
+                AsyncMock(return_value=[progress]),
+            ),
+            patch.object(
+                stremio,
+                "datastore_get",
+                AsyncMock(return_value=[_remote_library_item("tt0133093", None)]),
+            ),
+            patch.object(stremio, "datastore_put", datastore_put),
+        ):
+            await _push_stremio_connection(
+                SimpleNamespace(),
+                connection,
+                7,
+                api_key="tmdb-key",
+            )
+
+        pushed = datastore_put.await_args.args[1][0]
+        self.assertGreater(pushed["_mtime"], "2026-10")
+
 
 _POSTER_TEMPLATE = "https://openposterdb.example/secret-key/imdb/poster-default/{imdb}.jpg"
 
@@ -936,6 +976,23 @@ class StremioPosterTemplateTests(unittest.IsolatedAsyncioTestCase):
                 f"https://openposterdb.example/secret-key/imdb/poster-default/{content_id}.jpg",
             )
         self.assertTrue(pushed["tt0000003"]["removed"])
+
+    async def test_poster_rewrite_keeps_continue_watching_order(self) -> None:
+        # Stremio sorts by _mtime; stamping "now" on every rewritten poster
+        # tied the whole library and shuffled Continue Watching.
+        older = _remote_library_item("tt0000001", "https://image.tmdb.org/a.jpg")
+        older["_mtime"] = "2026-10-21T04:56:52.097Z"
+        newer = _remote_library_item("tt0000002", "https://image.tmdb.org/b.jpg")
+        newer["_mtime"] = "2026-10-27T05:27:25.373991234Z"
+        pushed = await self._push(
+            [],
+            [older, newer],
+            template=_POSTER_TEMPLATE,
+            pushed_ids=[],
+        )
+
+        self.assertEqual(pushed["tt0000001"]["_mtime"], "2026-10-21T04:56:52.098Z")
+        self.assertEqual(pushed["tt0000002"]["_mtime"], "2026-10-27T05:27:25.374Z")
 
     async def test_items_already_on_the_template_are_not_rewritten(self) -> None:
         pushed = await self._push(
