@@ -1,6 +1,8 @@
 import base64
+import re
 import zlib
 from typing import Any
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -11,6 +13,40 @@ LINK_URL = "https://link.stremio.com/api/v2"
 CINEMETA_URL = "https://v3-cinemeta.strem.io"
 LIBRARY_COLLECTION = "libraryItem"
 _TIMEOUT = 30.0
+
+
+POSTER_TEMPLATE_PLACEHOLDER = "{imdb}"
+_ENCODED_POSTER_PLACEHOLDER_RE = re.compile(r"%7Bimdb%7D", re.IGNORECASE)
+
+
+def validate_poster_template(value: str | None) -> str | None:
+    """Normalize a library poster URL template; blank clears it."""
+    # A URL copied from the address bar arrives as %7Bimdb%7D.
+    value = _ENCODED_POSTER_PLACEHOLDER_RE.sub(POSTER_TEMPLATE_PLACEHOLDER, (value or "").strip())
+    if not value:
+        return None
+    parts = urlsplit(value)
+    if parts.scheme not in ("http", "https") or not parts.hostname:
+        raise ValueError("Poster template must be an http(s) URL.")
+    if POSTER_TEMPLATE_PLACEHOLDER not in value:
+        raise ValueError(f"Poster template must contain {POSTER_TEMPLATE_PLACEHOLDER}.")
+    if len(value) > 1000:
+        raise ValueError("Poster template must be at most 1000 characters.")
+    return value
+
+
+def mask_poster_template(value: str | None) -> str | None:
+    """Display form of a poster template with everything but the host and the
+    {imdb} segment hidden - the path usually carries an API key."""
+    if not value:
+        return None
+    parts = urlsplit(value)
+    host = parts.hostname or ""
+    if parts.port:
+        host = f"{host}:{parts.port}"
+    last = parts.path.rsplit("/", 1)[-1]
+    tail = f"/{last}" if POSTER_TEMPLATE_PLACEHOLDER in last else ""
+    return f"{parts.scheme}://{host}/…{tail}"
 
 
 class StremioAPIError(RuntimeError):

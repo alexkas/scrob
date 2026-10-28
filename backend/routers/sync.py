@@ -6649,17 +6649,29 @@ def _stremio_sorted_videos(meta: dict) -> list[dict]:
     )
 
 
+_STREMIO_IMDB_ID_RE = re.compile(r"tt\d+")
+
+
+def _stremio_poster(template: str | None, content_id: str, fallback: str | None) -> str | None:
+    """Poster for a Stremio library item: the connection's template
+    (e.g. OpenPosterDB) when set and the id is IMDb, else `fallback`."""
+    if template and _STREMIO_IMDB_ID_RE.fullmatch(content_id):
+        return template.replace("{imdb}", content_id)
+    return fallback
+
+
 def _stremio_new_library_item(
     record: dict,
     now: str,
     *,
     in_library: bool = True,
+    poster_template: str | None = None,
 ) -> dict:
     return {
         "_id": record["content_id"],
         "name": record.get("name") or record.get("title") or record["content_id"],
         "type": record["content_type"],
-        "poster": record.get("poster"),
+        "poster": _stremio_poster(poster_template, str(record["content_id"]), record.get("poster")),
         "posterShape": record.get("poster_shape") or "poster",
         "removed": not in_library,
         "temp": not in_library,
@@ -6916,6 +6928,7 @@ async def _push_stremio_connection(
     )
     if target_ids is not None:
         removed_library_ids &= target_ids
+    poster_template = getattr(conn, "stremio_poster_template", None)
 
     lock = _stremio_push_locks.setdefault(conn.id, asyncio.Lock())
     async with lock:
@@ -6932,7 +6945,7 @@ async def _push_stremio_connection(
             content_id = str(record["content_id"])
             candidate = dict(
                 remote_by_id.get(content_id)
-                or _stremio_new_library_item(record, now)
+                or _stremio_new_library_item(record, now, poster_template=poster_template)
             )
             candidate["removed"] = False
             candidate["temp"] = False
@@ -6965,6 +6978,7 @@ async def _push_stremio_connection(
                     record,
                     now,
                     in_library=False,
+                    poster_template=poster_template,
                 )
             candidate = dict(base_item)
             state = {**_stremio_default_state(), **(candidate.get("state") or {})}
@@ -7025,7 +7039,12 @@ async def _push_stremio_connection(
             base_item = (
                 candidates.get(content_id)
                 or remote_by_id.get(content_id)
-                or _stremio_new_library_item(record, now, in_library=False)
+                or _stremio_new_library_item(
+                    record,
+                    now,
+                    in_library=False,
+                    poster_template=poster_template,
+                )
             )
             candidate = dict(base_item)
             state = {**_stremio_default_state(), **(candidate.get("state") or {})}
@@ -7057,6 +7076,15 @@ async def _push_stremio_connection(
                 ).isoformat().replace("+00:00", "Z")
             candidate["state"] = state
             candidates[content_id] = candidate
+
+        # The template applies to every IMDb-keyed item in the account, however
+        # it got there; items already on the templated poster aren't rewritten.
+        if poster_template:
+            for content_id, item in remote_by_id.items():
+                candidate = candidates.get(content_id) or item
+                poster = _stremio_poster(poster_template, content_id, candidate.get("poster"))
+                if poster != candidate.get("poster"):
+                    candidates[content_id] = {**candidate, "poster": poster}
 
         changes = []
         for content_id, candidate in candidates.items():

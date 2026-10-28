@@ -733,6 +733,13 @@ async def update_connection(
             update_data["server_username"] = str(account.get("email") or "Stremio")
         else:
             update_data.pop("token", None)
+        if "stremio_poster_template" in update_data:
+            try:
+                update_data["stremio_poster_template"] = stremio.validate_poster_template(
+                    update_data["stremio_poster_template"]
+                )
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc))
         update_data["sync_ratings"] = False
         update_data["push_ratings"] = False
         update_data["push_playback"] = update_data.get("push_playback", conn.push_playback)
@@ -783,6 +790,7 @@ async def update_connection(
         else:
             update_data["push_playback"] = False
             update_data["push_collection"] = False
+        update_data.pop("stremio_poster_template", None)
 
     # Re-enabling a watchlist sync direction starts from a clean bootstrap: a
     # baseline recorded under the old settings must not drive deletions.

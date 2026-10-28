@@ -576,6 +576,8 @@ export interface MediaServerConnection {
   push_ratings: boolean;
   auto_sync_interval: number | null;
   auto_push_interval: number | null;
+  /** Masked for display (host + {imdb} segment); Stremio only. */
+  stremio_poster_template?: string | null;
   created_at: string;
 }
 

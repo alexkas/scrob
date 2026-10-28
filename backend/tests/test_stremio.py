@@ -23,7 +23,7 @@ from models.connections import MediaServerConnection
 from models.media import Media
 from models.playback_progress import PlaybackProgress
 from models.show import Show
-from schemas import MediaServerConnectionResponse, StremioLinkPollRequest
+from schemas import MediaServerConnectionResponse, MediaServerConnectionUpdate, StremioLinkPollRequest
 from routers import auth
 from routers.history import _push_watch_state, dismiss_continue_watching
 from routers.sync import (
@@ -827,6 +827,208 @@ class StremioSyncTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(pushed["temp"])
         self.assertEqual(pushed["state"]["timeOffset"], 120_000)
         self.assertEqual(pushed["state"]["duration"], 600_000)
+
+
+_POSTER_TEMPLATE = "https://openposterdb.example/secret-key/imdb/poster-default/{imdb}.jpg"
+
+
+def _remote_library_item(content_id: str, poster: str | None) -> dict:
+    return {
+        "_id": content_id,
+        "name": content_id,
+        "type": "movie",
+        "poster": poster,
+        "posterShape": "poster",
+        "removed": False,
+        "temp": False,
+        "_ctime": "2026-01-01T00:00:00Z",
+        "_mtime": "2026-01-01T00:00:00Z",
+        "state": {},
+    }
+
+
+def _local_library_record(content_id: str) -> dict:
+    return {
+        "content_id": content_id,
+        "content_type": "movie",
+        "name": content_id,
+        "poster": f"https://image.tmdb.org/{content_id}.jpg",
+        "poster_shape": "poster",
+    }
+
+
+class StremioPosterTemplateTests(unittest.IsolatedAsyncioTestCase):
+    async def _push(
+        self,
+        local: list[dict],
+        remote: list[dict],
+        *,
+        template: str | None,
+        pushed_ids: list[str] | None,
+    ) -> dict[str, dict]:
+        connection = SimpleNamespace(
+            id=60,
+            token="auth-key",
+            push_collection=True,
+            push_watched=False,
+            push_playback=False,
+            stremio_pushed_library_ids=pushed_ids,
+            stremio_poster_template=template,
+        )
+        datastore_put = AsyncMock()
+        with (
+            patch("routers.sync._build_nuvio_library_items", AsyncMock(return_value=local)),
+            patch.object(stremio, "datastore_get", AsyncMock(return_value=remote)),
+            patch.object(stremio, "datastore_put", datastore_put),
+        ):
+            await _push_stremio_connection(SimpleNamespace(), connection, 7, api_key="tmdb-key")
+        return {
+            item["_id"]: item
+            for call in datastore_put.await_args_list
+            for item in call.args[1]
+        }
+
+    async def test_template_applied_to_new_items(self) -> None:
+        pushed = await self._push(
+            [_local_library_record("tt0133093")],
+            [],
+            template=_POSTER_TEMPLATE,
+            pushed_ids=None,
+        )
+
+        self.assertEqual(
+            pushed["tt0133093"]["poster"],
+            "https://openposterdb.example/secret-key/imdb/poster-default/tt0133093.jpg",
+        )
+
+    async def test_template_applied_to_previously_pushed_items(self) -> None:
+        pushed = await self._push(
+            [_local_library_record("tt0133093")],
+            [_remote_library_item("tt0133093", "https://image.tmdb.org/old.jpg")],
+            template=_POSTER_TEMPLATE,
+            pushed_ids=["tt0133093"],
+        )
+
+        self.assertEqual(
+            pushed["tt0133093"]["poster"],
+            "https://openposterdb.example/secret-key/imdb/poster-default/tt0133093.jpg",
+        )
+
+    async def test_template_applied_to_user_added_items(self) -> None:
+        # tt0133093 is also in the Scrob collection; tt0000002 exists only in
+        # Stremio; tt0000003 was removed from the library (history only).
+        removed = _remote_library_item("tt0000003", None)
+        removed["removed"] = True
+        pushed = await self._push(
+            [_local_library_record("tt0133093")],
+            [
+                _remote_library_item("tt0133093", "https://user.example/poster.jpg"),
+                _remote_library_item("tt0000002", "https://user.example/other.jpg"),
+                removed,
+            ],
+            template=_POSTER_TEMPLATE,
+            pushed_ids=[],
+        )
+
+        for content_id in ("tt0133093", "tt0000002", "tt0000003"):
+            self.assertEqual(
+                pushed[content_id]["poster"],
+                f"https://openposterdb.example/secret-key/imdb/poster-default/{content_id}.jpg",
+            )
+        self.assertTrue(pushed["tt0000003"]["removed"])
+
+    async def test_items_already_on_the_template_are_not_rewritten(self) -> None:
+        pushed = await self._push(
+            [],
+            [
+                _remote_library_item(
+                    "tt0000002",
+                    "https://openposterdb.example/secret-key/imdb/poster-default/tt0000002.jpg",
+                )
+            ],
+            template=_POSTER_TEMPLATE,
+            pushed_ids=[],
+        )
+
+        self.assertEqual(pushed, {})
+
+    async def test_non_imdb_ids_keep_the_tmdb_poster(self) -> None:
+        pushed = await self._push(
+            [_local_library_record("tmdb:603"), _local_library_record("tmdb:604")],
+            [_remote_library_item("tmdb:604", "https://image.tmdb.org/old.jpg")],
+            template=_POSTER_TEMPLATE,
+            pushed_ids=["tmdb:604"],
+        )
+
+        self.assertEqual(pushed["tmdb:603"]["poster"], "https://image.tmdb.org/tmdb:603.jpg")
+        self.assertNotIn("tmdb:604", pushed)
+
+    async def test_unset_template_keeps_current_behavior(self) -> None:
+        pushed = await self._push(
+            [_local_library_record("tt0133093"), _local_library_record("tt0000001")],
+            [_remote_library_item("tt0000001", "https://image.tmdb.org/old.jpg")],
+            template=None,
+            pushed_ids=["tt0000001"],
+        )
+
+        self.assertEqual(pushed["tt0133093"]["poster"], "https://image.tmdb.org/tt0133093.jpg")
+        self.assertNotIn("tt0000001", pushed)
+
+    def test_connection_response_masks_poster_template(self) -> None:
+        response = MediaServerConnectionResponse.model_validate(
+            {
+                "id": 1,
+                "user_id": 7,
+                "type": "stremio",
+                "name": "Stremio",
+                "url": stremio.DEFAULT_URL,
+                "token": "secret-auth-key",
+                "stremio_poster_template": _POSTER_TEMPLATE,
+                "created_at": datetime(2026, 7, 31),
+            }
+        )
+
+        self.assertEqual(response.stremio_poster_template, "https://openposterdb.example/…/{imdb}.jpg")
+        self.assertNotIn("secret-key", response.model_dump_json())
+
+    async def _update(self, connection: SimpleNamespace, template: str):
+        db = SimpleNamespace(
+            execute=AsyncMock(return_value=SimpleNamespace(scalar_one_or_none=lambda: connection)),
+            commit=AsyncMock(),
+            refresh=AsyncMock(),
+        )
+        return await auth.update_connection(
+            connection.id,
+            MediaServerConnectionUpdate(stremio_poster_template=template),
+            db=db,
+            current_user=SimpleNamespace(id=7),
+        )
+
+    async def test_update_saves_and_clears_template(self) -> None:
+        connection = _stremio_connection(stremio_poster_template=None)
+
+        await self._update(connection, f"  {_POSTER_TEMPLATE}  ")
+        self.assertEqual(connection.stremio_poster_template, _POSTER_TEMPLATE)
+
+        await self._update(connection, "")
+        self.assertIsNone(connection.stremio_poster_template)
+
+    async def test_update_decodes_percent_encoded_placeholder(self) -> None:
+        connection = _stremio_connection(stremio_poster_template=None)
+
+        await self._update(connection, _POSTER_TEMPLATE.replace("{imdb}", "%7bimdb%7D"))
+
+        self.assertEqual(connection.stremio_poster_template, _POSTER_TEMPLATE)
+
+    async def test_update_rejects_template_without_placeholder_without_echoing_it(self) -> None:
+        connection = _stremio_connection(stremio_poster_template=None)
+
+        with self.assertRaises(HTTPException) as ctx:
+            await self._update(connection, "https://openposterdb.example/secret-key/poster.jpg")
+
+        self.assertEqual(ctx.exception.status_code, 400)
+        self.assertNotIn("secret-key", str(ctx.exception.detail))
+        self.assertIsNone(connection.stremio_poster_template)
 
 
 class StremioDismissTests(unittest.IsolatedAsyncioTestCase):

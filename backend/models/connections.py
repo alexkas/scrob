@@ -55,6 +55,9 @@ class MediaServerConnection(Base):
     stremio_pull_cursor_at     : Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     stremio_full_sync_done     : Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
     stremio_pushed_library_ids : Mapped[Optional[list]] = mapped_column(JSONB, nullable=True)
+    # Poster URL template applied to every IMDb-keyed Stremio library item, e.g.
+    # an OpenPosterDB URL with "{imdb}". Contains an API key: never log or echo it.
+    stremio_poster_template    : Mapped[Optional[str]] = mapped_column(String(1000), nullable=True)
 
     # Plex watchlist ↔ Scrob list sync (Plex connections only)
     plex_sync_watchlist : Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")

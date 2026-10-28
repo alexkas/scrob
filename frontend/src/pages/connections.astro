@@ -117,6 +117,22 @@ const sonarrConfigured   = !!(settings.sonarr_url && settings.sonarr_token);
                         </div>
                       )}
                       {conn.type === "stremio" && (
+                        <div class="space-y-2">
+                          <label class="block text-sm font-medium text-zinc-400">Library poster URL template</label>
+                          <p class="text-xs text-zinc-500">Applied to every item in your Stremio library with an IMDb id on each push. <code class="text-zinc-400">{"{imdb}"}</code> is replaced with the IMDb id. Leave blank to keep the saved template.</p>
+                          <div class="flex gap-2">
+                            <div class="relative flex-1">
+                              <input type="password" class="conn-poster-template-input w-full bg-zinc-950 border border-zinc-800 rounded-lg pl-4 pr-10 py-3 text-zinc-100 focus:outline-none focus:ring-2 focus:ring-blue-500 transition-all" value="" data-conn-id={conn.id} autocomplete="off" placeholder={conn.stremio_poster_template ? `Saved: ${conn.stremio_poster_template}` : "https://openposterdb.noreturn.cc/<KEY>/imdb/poster-default/{imdb}.jpg"} />
+                              <button type="button" class="password-toggle absolute right-2 top-1/2 -translate-y-1/2 text-zinc-500 hover:text-zinc-300 p-1 cursor-pointer transition-colors" aria-label="Toggle template visibility">
+                                <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor" class="w-5 h-5 eye-icon"><path stroke-linecap="round" stroke-linejoin="round" d="M2.036 12.322a1.012 1.012 0 010-.644C3.412 7.943 7.213 5 12 5c4.787 0 8.588 2.943 9.964 6.678.066.18.066.362 0 .544C20.588 16.057 16.787 19 12 19c-4.787 0-8.588-2.943-9.964-6.678z" /><path stroke-linecap="round" stroke-linejoin="round" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" /></svg>
+                                <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor" class="w-5 h-5 eye-slash-icon hidden"><path stroke-linecap="round" stroke-linejoin="round" d="M3.98 8.223A10.477 10.477 0 001.934 12C3.226 16.338 7.244 19.5 12 19.5c.993 0 1.953-.138 2.863-.395M6.228 6.228A10.45 10.45 0 0112 4.5c4.756 0 8.773 3.162 10.065 7.498a10.523 10.523 0 01-4.293 5.774M6.228 6.228L3 3m3.228 3.228l3.65 3.65m7.894 7.894L21 21m-3.228-3.228l-3.65-3.65m0 0a3 3 0 10-4.243-4.243m4.242 4.242L9.88 9.88" /></svg>
+                              </button>
+                            </div>
+                            <button type="button" class={`conn-poster-template-clear px-3 py-2 bg-zinc-800 hover:bg-zinc-700 border border-zinc-700 text-zinc-300 text-sm rounded-lg transition-colors cursor-pointer ${conn.stremio_poster_template ? "" : "hidden"}`} data-conn-id={conn.id}>Clear</button>
+                          </div>
+                        </div>
+                      )}
+                      {conn.type === "stremio" && (
                         <div class="stremio-reauth hidden space-y-2" data-conn-id={conn.id}>
                           <button type="button" class="stremio-reauth-toggle text-sm text-blue-400 hover:text-blue-300 cursor-pointer transition-colors">
                             Disconnected? Reconnect Stremio
@@ -3403,6 +3419,9 @@ const sonarrConfigured   = !!(settings.sonarr_url && settings.sonarr_token);
               const selected = [...userPicker.querySelectorAll('.plex-user-checkbox:checked')].map((cb: any) => cb.getAttribute('data-user-id'));
               body.watchlist_monitored_users = selected;
             }
+            // Blank keeps the saved template; clearing goes through its own button.
+            const posterTemplate = (card?.querySelector('.conn-poster-template-input') as HTMLInputElement | null)?.value.trim();
+            if (posterTemplate) body.stremio_poster_template = posterTemplate;
             const saveRes = await fetch(`/api/proxy/auth/connections/${connId}`, {
               method: 'PATCH',
               headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
@@ -3415,6 +3434,7 @@ const sonarrConfigured   = !!(settings.sonarr_url && settings.sonarr_token);
             const savedConnection = await saveRes.json();
             const savedTokenInput = card?.querySelector('.conn-token-input') as HTMLInputElement | null;
             if (savedTokenInput && savedConnection.token) savedTokenInput.value = savedConnection.token;
+            applyPosterTemplateState(card, savedConnection.stremio_poster_template);
             // Save libraries if they've been loaded
             const libList = card?.querySelector('.conn-libraries-list');
             if (libList && libList.querySelector('.library-checkbox')) {
@@ -4646,6 +4666,18 @@ const sonarrConfigured   = !!(settings.sonarr_url && settings.sonarr_token);
     });
   }
 
+  // The saved template carries an API key, so the API only returns a masked
+  // preview: show it as the placeholder and keep the input itself empty.
+  function applyPosterTemplateState(card: Element | null, masked: string | null | undefined) {
+    const input = card?.querySelector('.conn-poster-template-input') as HTMLInputElement | null;
+    if (!input) return;
+    input.value = '';
+    input.placeholder = masked
+      ? `Saved: ${masked}`
+      : 'https://openposterdb.noreturn.cc/<KEY>/imdb/poster-default/{imdb}.jpg';
+    card?.querySelector('.conn-poster-template-clear')?.classList.toggle('hidden', !masked);
+  }
+
   function setupConnections() {
     const apiKey = (document.getElementById('scrob_api_key') as HTMLInputElement | null)?.value ?? '';
 
@@ -4668,6 +4700,27 @@ const sonarrConfigured   = !!(settings.sonarr_url && settings.sonarr_token);
           }
         });
       }
+      const clearPosterBtn = card.querySelector('.conn-poster-template-clear') as HTMLButtonElement | null;
+      clearPosterBtn?.addEventListener('click', async () => {
+        clearPosterBtn.disabled = true;
+        try {
+          const res = await fetch(`/api/proxy/auth/connections/${connId}`, {
+            method: 'PATCH',
+            headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ stremio_poster_template: '' }),
+          });
+          if (!res.ok) {
+            const err = await res.json().catch(() => ({}));
+            throw new Error(err.detail || 'Failed to clear poster template');
+          }
+          applyPosterTemplateState(card, (await res.json()).stremio_poster_template);
+          showMessage('Poster template cleared.');
+        } catch (err: any) {
+          showMessage(err.message || 'Failed to clear poster template', 'error');
+        } finally {
+          clearPosterBtn.disabled = false;
+        }
+      });
     });
 
     // Nuvio: an existing connection's saved refresh token can die (Nuvio

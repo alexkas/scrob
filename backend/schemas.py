@@ -387,17 +387,24 @@ class MediaServerConnectionUpdate(BaseModel):
     watchlist_monitored_users: Optional[list[str]] = None
     plex_sync_watchlist: Optional[bool] = None
     plex_push_watchlist: Optional[bool] = None
+    # Stremio only; "" clears it. Validated in the route so a 400 never echoes it.
+    stremio_poster_template: Optional[str] = None
 
 
 class MediaServerConnectionResponse(MediaServerConnectionBase):
     id: int
     user_id: int
     created_at: datetime
+    # Masked for display (host + {imdb} segment); the stored value has an API key.
+    stremio_poster_template: Optional[str] = None
 
     @model_validator(mode="after")
     def redact_cloud_credentials(self):
+        from core.stremio import mask_poster_template
+
         if self.type in ("stremio", "arvio"):
             self.token = ""
+        self.stremio_poster_template = mask_poster_template(self.stremio_poster_template)
         return self
 
     model_config = ConfigDict(from_attributes=True)
