@@ -6,7 +6,8 @@ from fastapi import APIRouter, Depends, Query, HTTPException, BackgroundTasks
 from pydantic import BaseModel, model_validator
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy import text, select, update, delete, func, cast, bindparam, DateTime, literal_column
-from sqlalchemy.orm import selectinload
+from sqlalchemy.orm import aliased, selectinload
+from sqlalchemy.orm.attributes import flag_modified
 from sqlalchemy.dialects.postgresql import insert, JSONB
 
 from db import get_db, engine
@@ -4653,10 +4654,10 @@ async def _apply_nuvio_progress(
 ) -> None:
     """Upsert progress rows inside the 5-90% window and drop the rest.
 
-    mirror_all keeps every row with a position instead (Stremio): its
-    records only exist while the item is in Stremio's Continue Watching,
-    which includes a just-started episode and the "next episode" marker
-    (timeOffset 1ms)."""
+    mirror_all keeps every row with a position, or flagged `notified`,
+    instead (Stremio): its records only exist while the item is in Stremio's
+    Continue Watching, which includes a just-started episode, the "next
+    episode" marker (timeOffset 1ms) and a series with new episodes at 0."""
     movie_tmdb_ids = {
         tmdb_id
         for row in rows
@@ -4726,17 +4727,25 @@ async def _apply_nuvio_progress(
             duration_ms = max(0, int(row.get("duration") or 0))
         except (TypeError, ValueError):
             continue
-        if duration_ms <= 0:
+        if duration_ms <= 0 and not mirror_all:
             continue
-        progress_percent = min(1.0, position_ms / duration_ms)
+        progress_percent = min(1.0, position_ms / duration_ms) if duration_ms > 0 else 0.0
         progress = existing.get(media.id)
-        in_window = position_ms > 0 if mirror_all else 0.05 <= progress_percent < 0.90
+        in_window = (
+            position_ms > 0 or bool(row.get("notified"))
+            if mirror_all
+            else 0.05 <= progress_percent < 0.90
+        )
         if in_window:
             updated_at = _nuvio_datetime(row.get("last_watched")) or utcnow()
             if progress:
                 progress.progress_percent = progress_percent
                 progress.progress_seconds = position_ms // 1000
                 progress.updated_at = updated_at
+                # Assigning an unchanged value isn't a change to SQLAlchemy, so
+                # the column's onupdate=utcnow would overwrite it with the sync
+                # time whenever another column changed.
+                flag_modified(progress, "updated_at")
             else:
                 progress = PlaybackProgress(
                     user_id=user_id,
@@ -4747,6 +4756,8 @@ async def _apply_nuvio_progress(
                 )
                 db.add(progress)
                 existing[media.id] = progress
+            if "sort_at" in row:
+                progress.sort_at = _nuvio_datetime(row["sort_at"])
         elif progress:
             await db.delete(progress)
             existing.pop(media.id, None)
@@ -5099,19 +5110,93 @@ def _stremio_series_imdb_id(item: dict) -> str | None:
     return None
 
 
+# Mirrors stremio-core's NOTIFICATION_ITEMS_COUNT: notifications are pulled for
+# the most recently modified eligible library items only.
+_STREMIO_NOTIFICATION_ITEMS_COUNT = 100
+
+
+def _stremio_pulls_notifications(item: dict) -> bool:
+    """stremio-core's LibraryItem::should_pull_notifications."""
+    state = item.get("state") if isinstance(item.get("state"), dict) else {}
+    behavior_hints = item.get("behaviorHints") if isinstance(item.get("behaviorHints"), dict) else {}
+    return (
+        item.get("type") == "series"
+        and not item.get("removed")
+        and not item.get("temp")
+        and not state.get("noNotif")
+        and not behavior_hints.get("defaultVideoId")
+    )
+
+
+def _stremio_notified_videos(item: dict, last_videos: list[dict], now_ms: int) -> list[dict]:
+    """New-episode notifications Stremio shows for this item, oldest first:
+    videos from Cinemeta's last-videos released after lastWatched and not in
+    the future. A series never watched gets none (stremio-core skips it)."""
+    if not _stremio_pulls_notifications(item):
+        return []
+    state = item.get("state") if isinstance(item.get("state"), dict) else {}
+    last_watched = _stremio_epoch_ms(state.get("lastWatched"))
+    if last_watched is None:
+        return []
+    return _stremio_sorted_videos({
+        "videos": [
+            video
+            for video in last_videos
+            if (released_ms := _stremio_epoch_ms(video.get("released"))) is not None
+            and last_watched < released_ms <= now_ms
+        ]
+    })
+
+
+async def _stremio_last_videos(items: list[dict]) -> dict[str, list[dict]] | None:
+    """Cinemeta last-videos for the library items Stremio pulls notifications
+    for, or None when Cinemeta can't be reached (notifications unknown)."""
+    eligible = sorted(
+        (item for item in items if _stremio_pulls_notifications(item)),
+        key=lambda item: _stremio_epoch_ms(item.get("_mtime")) or 0,
+        reverse=True,
+    )[:_STREMIO_NOTIFICATION_ITEMS_COUNT]
+    # Cinemeta only knows IMDb ids; a tmdb:<id> library item gets nothing,
+    # as it does in Stremio when only Cinemeta serves last-videos.
+    imdb_ids = [
+        str(item["_id"])
+        for item in eligible
+        if re.fullmatch(r"tt\d+", str(item.get("_id") or ""), flags=re.IGNORECASE)
+    ]
+    if not imdb_ids:
+        return {}
+    import httpx as _httpx
+    try:
+        return await stremio.get_cinemeta_last_videos(imdb_ids)
+    except (stremio.StremioAPIError, _httpx.HTTPError) as exc:
+        logger.warning("Cinemeta last-videos unavailable, keeping Stremio notifications as they were: %s", exc)
+        return None
+
+
 async def _stremio_records(
     items: list[dict],
+    *,
+    progress_only_ids: set[str] = frozenset(),
 ) -> tuple[list[dict], list[dict], list[dict], list[dict], set[str]]:
     """Split Stremio library items into library, watched, progress and
     progress-clear records plus the ids removed from the library.
 
-    Stremio shows an item in Continue Watching only while
-    `(!removed || temp) && timeOffset > 0`, and tracks a single `video_id`
-    per series. A clear record marks progress Scrob should drop because the
-    item left Continue Watching; a series clear with `keep_season` /
-    `keep_episode` drops every episode's progress except the current one.
-    `cleared_at` (epoch ms) is the item's latest Stremio timestamp, so
-    progress written after it by another source survives."""
+    Mirrors stremio-core's Continue Watching: an item is in it while
+    `(!removed || temp) && timeOffset > 0`, or while it is a library series
+    with new-episode notifications. A series tracks one `video_id`; a
+    notification-only series is mirrored as its oldest new episode at 0%.
+    Each progress record's `sort_at` is Stremio's rank: the newest
+    notification's release, else the item's _mtime.
+
+    A clear record marks progress Scrob should drop because the item left
+    Continue Watching; a series clear with `keep_season` / `keep_episode`
+    drops every episode's progress except the mirrored one. `cleared_at`
+    (epoch ms) is the item's latest Stremio timestamp, so progress written
+    after it by another source survives.
+
+    Items in progress_only_ids are unchanged since the last pull and were
+    only re-read for their Continue Watching state, so they produce no
+    library, watched or removal records."""
     records = [
         item
         for item in items
@@ -5121,12 +5206,15 @@ async def _stremio_records(
     removed_ids = {
         str(item.get("_id"))
         for item in items
-        if item.get("removed") and _stremio_valid_content_id(item.get("_id"))
+        if item.get("removed")
+        and _stremio_valid_content_id(item.get("_id"))
+        and str(item.get("_id")) not in progress_only_ids
     }
     series_needing_meta = [
         item
         for item in records
         if item.get("type") == "series"
+        and str(item["_id"]) not in progress_only_ids
         and (
             (item.get("state") or {}).get("watched")
             or (item.get("state") or {}).get("video_id")
@@ -5138,29 +5226,29 @@ async def _stremio_records(
         if (imdb_id := _stremio_series_imdb_id(item)) is not None
     }
     metas = await _stremio_series_metadata(set(series_imdb_ids.values()))
+    last_videos = await _stremio_last_videos(records)
 
     library_records: list[dict] = []
     watched_records: list[dict] = []
     progress_records: list[dict] = []
     progress_clears: list[dict] = []
+    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
     for item in records:
         content_id = str(item["_id"])
         content_type = str(item["type"])
         title = str(item.get("name") or content_id)
         state = item.get("state") if isinstance(item.get("state"), dict) else {}
+        progress_only = content_id in progress_only_ids
         base = {
             "content_id": content_id,
             "content_type": content_type,
             "title": title,
         }
-        if not item.get("removed") and not item.get("temp"):
+        if not item.get("removed") and not item.get("temp") and not progress_only:
             library_records.append(base)
         last_watched = _stremio_epoch_ms(state.get("lastWatched"))
-        stamps = [
-            stamp
-            for stamp in (last_watched, _stremio_epoch_ms(item.get("_mtime")))
-            if stamp is not None
-        ]
+        mtime = _stremio_epoch_ms(item.get("_mtime"))
+        stamps = [stamp for stamp in (last_watched, mtime) if stamp is not None]
         cleared_at = max(stamps) if stamps else None
         # A temp item is a removed placeholder that still holds watch state,
         # and Stremio keeps showing it in Continue Watching.
@@ -5170,80 +5258,98 @@ async def _stremio_records(
             duration = int(state.get("duration") or 0)
         except (TypeError, ValueError):
             position = duration = 0
-        in_continue_watching = in_library_state and position > 0
+        resumable = in_library_state and position > 0
 
         if content_type == "movie":
             try:
                 times_watched = int(state.get("timesWatched") or 0)
             except (TypeError, ValueError):
                 times_watched = 0
-            if times_watched > 0:
+            if times_watched > 0 and not progress_only:
                 watched_records.append({**base, "watched_at": last_watched})
-            if not in_continue_watching:
+            if not resumable:
                 progress_clears.append({**base, "cleared_at": cleared_at})
-            elif duration > 0:
+            else:
                 progress_records.append(
                     {
                         **base,
                         "position": position,
                         "duration": duration,
                         "last_watched": last_watched,
+                        "sort_at": mtime,
                     }
                 )
             continue
 
         videos = _stremio_sorted_videos(metas.get(series_imdb_ids.get(content_id, content_id), {}))
-        video_ids = [str(video["id"]) for video in videos]
-        watched_ids = stremio.decode_watched_bitfield(state.get("watched"), video_ids)
-        for video in videos:
-            video_id = str(video["id"])
-            if video_id not in watched_ids:
-                continue
-            parts = _stremio_video_parts(video)
-            if parts is None:
-                continue
-            season, episode = parts
-            watched_records.append(
-                {
-                    **base,
-                    "title": str(video.get("name") or title),
-                    "season": season,
-                    "episode": episode,
-                    "watched_at": last_watched,
-                }
-            )
+        if not progress_only:
+            video_ids = [str(video["id"]) for video in videos]
+            watched_ids = stremio.decode_watched_bitfield(state.get("watched"), video_ids)
+            for video in videos:
+                video_id = str(video["id"])
+                if video_id not in watched_ids:
+                    continue
+                parts = _stremio_video_parts(video)
+                if parts is None:
+                    continue
+                season, episode = parts
+                watched_records.append(
+                    {
+                        **base,
+                        "title": str(video.get("name") or title),
+                        "season": season,
+                        "episode": episode,
+                        "watched_at": last_watched,
+                    }
+                )
 
-        current_video_id = str(state.get("video_id") or "")
-        current_video = next(
-            (video for video in videos if str(video.get("id")) == current_video_id),
-            {"id": current_video_id},
-        )
-        current_parts = _stremio_video_parts(current_video)
-        if not in_continue_watching:
+        notifications_known = last_videos is not None or not _stremio_pulls_notifications(item)
+        if not resumable and not notifications_known:
+            # Whether Stremio lists it hinges on notifications we couldn't
+            # read - leave Scrob's row as it is rather than guess.
+            continue
+        notified = _stremio_notified_videos(item, (last_videos or {}).get(content_id, []), now_ms)
+
+        if resumable:
+            current_video_id = str(state.get("video_id") or "")
+            mirrored_video = next(
+                (video for video in videos if str(video.get("id")) == current_video_id),
+                {"id": current_video_id},
+            )
+        elif notified:
+            mirrored_video = notified[0]
+            position = duration = 0
+        else:
             progress_clears.append({**base, "cleared_at": cleared_at})
-        elif current_parts:
-            season, episode = current_parts
-            progress_clears.append(
-                {
-                    **base,
-                    "cleared_at": cleared_at,
-                    "keep_season": season,
-                    "keep_episode": episode,
-                }
+            continue
+        mirrored_parts = _stremio_video_parts(mirrored_video)
+        if mirrored_parts is None:
+            continue
+        season, episode = mirrored_parts
+        progress_clears.append(
+            {
+                **base,
+                "cleared_at": cleared_at,
+                "keep_season": season,
+                "keep_episode": episode,
+            }
+        )
+        record = {
+            **base,
+            "title": str(mirrored_video.get("name") or title),
+            "season": season,
+            "episode": episode,
+            "position": position,
+            "duration": duration,
+            "last_watched": last_watched,
+            "notified": bool(notified),
+        }
+        if notifications_known:
+            record["sort_at"] = max(
+                (_stremio_epoch_ms(video.get("released")) for video in notified),
+                default=mtime,
             )
-        if in_continue_watching and current_parts and duration > 0:
-            season, episode = current_parts
-            progress_records.append(
-                {
-                    **base,
-                    "title": str(current_video.get("name") or title),
-                    "season": season,
-                    "episode": episode,
-                    "position": position,
-                    "duration": duration,
-                    "last_watched": last_watched,
-                }
-            )
+        progress_records.append(record)
     return library_records, watched_records, progress_records, progress_clears, removed_ids
 
 
@@ -5405,15 +5511,49 @@ async def _remove_stremio_collection_sources(
     return removed_media_ids
 
 
+async def _stremio_library_series_ids(
+    db: AsyncSession,
+    user_id: int,
+    connection_id: int,
+) -> set[str]:
+    """Stremio ids of the series in the user's Stremio library (as collected
+    by the last pulls). Their new-episode notifications can add or reorder
+    Continue Watching entries without changing the Stremio item, so an
+    incremental pull would never see them."""
+    result = await db.execute(
+        select(CollectionFile.source_id)
+        .join(Collection, Collection.id == CollectionFile.collection_id)
+        .join(Media, Media.id == Collection.media_id)
+        .where(
+            Collection.user_id == user_id,
+            CollectionFile.source == CollectionSource.stremio,
+            CollectionFile.connection_id == connection_id,
+            Media.media_type == MediaType.series,
+        )
+        .distinct()
+    )
+    prefix = f"{connection_id}:"
+    return {
+        source_id[len(prefix):]
+        for source_id in result.scalars().all()
+        if source_id and source_id.startswith(prefix)
+    }
+
+
 async def _pull_stremio_items(
     conn: MediaServerConnection,
     *,
     full_resync: bool,
-) -> tuple[list[dict], bool, datetime]:
+    always_ids: set[str] = frozenset(),
+) -> tuple[list[dict], bool, datetime, set[str]]:
+    """Fetch the items to process: every item on a complete snapshot,
+    otherwise those modified since the cursor plus always_ids. Returns the
+    always_ids that were not modified as the last element - they are only
+    re-read for their Continue Watching state."""
     started_at = datetime.now(timezone.utc).replace(tzinfo=None)
     complete_snapshot = full_resync or not conn.stremio_full_sync_done or conn.stremio_pull_cursor_at is None
     if complete_snapshot:
-        return await stremio.datastore_get(conn.token, all_items=True), True, started_at
+        return await stremio.datastore_get(conn.token, all_items=True), True, started_at, set()
 
     cutoff = conn.stremio_pull_cursor_at - timedelta(minutes=5)
     meta = await stremio.datastore_meta(conn.token)
@@ -5425,7 +5565,9 @@ async def _pull_stremio_items(
         modified_at = _nuvio_datetime(_stremio_epoch_ms(row[1]))
         if item_id and modified_at is not None and modified_at >= cutoff:
             changed_ids.append(item_id)
-    return await stremio.datastore_get(conn.token, ids=changed_ids), False, started_at
+    unchanged_ids = set(always_ids) - set(changed_ids)
+    items = await stremio.datastore_get(conn.token, ids=[*changed_ids, *sorted(unchanged_ids)])
+    return items, False, started_at, unchanged_ids
 
 
 async def run_stremio_sync(
@@ -5479,9 +5621,14 @@ async def _run_stremio_sync(
             if not conn or not tmdb_api_key:
                 raise RuntimeError("Missing Stremio connection or TMDB API key")
 
-            items, complete_snapshot, pull_started_at = await _pull_stremio_items(
+            items, complete_snapshot, pull_started_at, progress_only_ids = await _pull_stremio_items(
                 conn,
                 full_resync=full_resync,
+                always_ids=(
+                    await _stremio_library_series_ids(db, user_id, conn.id)
+                    if conn.sync_playback
+                    else set()
+                ),
             )
             (
                 library_records,
@@ -5489,7 +5636,7 @@ async def _run_stremio_sync(
                 progress_records,
                 progress_clears,
                 removed_ids,
-            ) = await _stremio_records(items)
+            ) = await _stremio_records(items, progress_only_ids=progress_only_ids)
             if not conn.sync_collection:
                 library_records = []
                 removed_ids = set()
@@ -6601,11 +6748,13 @@ async def _rewind_stremio_progress(
 ) -> int:
     """Drop items dismissed in Scrob from Stremio's Continue Watching.
 
-    Mirrors stremio-core's RewindLibraryItem: only `timeOffset` goes to 0 and
-    the rest of the current remote record is kept. A series is rewound only
-    while Stremio's current `video_id` is the dismissed episode - dismissing a
-    stale episode must not drop the one Stremio is actually on. Returns the
-    number of items written."""
+    Does what Stremio's own dismiss does (stremio-web dispatches
+    RewindLibraryItem then DismissNotificationItem): `timeOffset` goes to 0,
+    and a series with new-episode notifications gets `lastWatched` = now; the
+    rest of the current remote record is kept. A series is only touched while
+    the dismissed episode is the one Scrob mirrors for it - dismissing a stale
+    episode must not drop the one Stremio is actually on. Returns the number
+    of items written."""
     records = await _stremio_media_records(db, media_ids, api_key)
     if not records:
         return 0
@@ -6640,19 +6789,35 @@ async def _rewind_stremio_progress(
     lock = _stremio_push_locks.setdefault(conn.id, asyncio.Lock())
     async with lock:
         remote_items = await stremio.datastore_get(conn.token, ids=sorted(targets))
-        now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        last_videos = await _stremio_last_videos(remote_items) or {}
+        now_dt = datetime.now(timezone.utc)
+        now = now_dt.isoformat().replace("+00:00", "Z")
+        now_ms = int(now_dt.timestamp() * 1000)
         changes = []
         for item in remote_items:
             content_id = str(item.get("_id") or "")
             if content_id not in targets:
                 continue
             state = item.get("state") if isinstance(item.get("state"), dict) else {}
-            if not state.get("timeOffset"):
+            resumable = (not item.get("removed") or bool(item.get("temp"))) and bool(state.get("timeOffset"))
+            notified = _stremio_notified_videos(item, last_videos.get(content_id, []), now_ms)
+            if not resumable and not notified:
                 continue
             episode = targets[content_id]
-            if episode is not None and _stremio_video_parts({"id": state.get("video_id")}) != episode:
-                continue
-            changes.append({**item, "state": {**state, "timeOffset": 0}, "_mtime": now})
+            if episode is not None:
+                mirrored = (
+                    _stremio_video_parts({"id": state.get("video_id")})
+                    if resumable
+                    else _stremio_video_parts(notified[0])
+                )
+                if mirrored != episode:
+                    continue
+            next_state = {**state, "timeOffset": 0}
+            if notified:
+                # DismissNotificationItem: a later lastWatched retires the
+                # notifications, exactly as Stremio's own dismiss does.
+                next_state["lastWatched"] = now
+            changes.append({**item, "state": next_state, "_mtime": now})
         await stremio.datastore_put(conn.token, changes)
     return len(changes)
 

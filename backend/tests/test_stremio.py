@@ -31,6 +31,7 @@ from routers.sync import (
     _pull_stremio_items,
     _push_stremio_connection,
     _rewind_stremio_progress,
+    _stremio_notified_videos,
     _stremio_records,
     _stremio_same_item,
     _stremio_sorted_videos,
@@ -122,6 +123,12 @@ class StremioBitfieldTests(unittest.TestCase):
 
 
 class StremioSyncTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self) -> None:
+        # Library series pull Cinemeta last-videos for notifications; none by default.
+        patcher = patch.object(stremio, "get_cinemeta_last_videos", AsyncMock(return_value={}))
+        self.last_videos = patcher.start()
+        self.addCleanup(patcher.stop)
+
     async def test_incremental_pull_consumes_datastore_meta_tuples(self) -> None:
         cursor = datetime.now(timezone.utc).replace(tzinfo=None)
         recent_ms = int((cursor - timedelta(minutes=1)).replace(tzinfo=timezone.utc).timestamp() * 1000)
@@ -144,7 +151,7 @@ class StremioSyncTests(unittest.IsolatedAsyncioTestCase):
                 AsyncMock(return_value=[{"_id": "tt-recent"}]),
             ) as datastore_get,
         ):
-            items, complete_snapshot, started_at = await _pull_stremio_items(
+            items, complete_snapshot, started_at, progress_only_ids = await _pull_stremio_items(
                 connection,
                 full_resync=False,
             )
@@ -152,7 +159,31 @@ class StremioSyncTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(items, [{"_id": "tt-recent"}])
         self.assertFalse(complete_snapshot)
         self.assertGreaterEqual(started_at, cursor)
+        self.assertEqual(progress_only_ids, set())
         datastore_get.assert_awaited_once_with("auth-key", ids=["tt-recent"])
+
+    async def test_incremental_pull_always_refetches_library_series(self) -> None:
+        cursor = datetime.now(timezone.utc).replace(tzinfo=None)
+        recent_ms = int((cursor - timedelta(minutes=1)).replace(tzinfo=timezone.utc).timestamp() * 1000)
+        connection = SimpleNamespace(
+            token="auth-key",
+            stremio_full_sync_done=True,
+            stremio_pull_cursor_at=cursor,
+        )
+
+        with (
+            patch.object(stremio, "datastore_meta", AsyncMock(return_value=[["tt-recent", recent_ms]])),
+            patch.object(stremio, "datastore_get", AsyncMock(return_value=[])) as datastore_get,
+        ):
+            *_, progress_only_ids = await _pull_stremio_items(
+                connection,
+                full_resync=False,
+                always_ids={"tt23112594", "tt-recent"},
+            )
+
+        datastore_get.assert_awaited_once_with("auth-key", ids=["tt-recent", "tt23112594"])
+        # tt-recent changed, so it gets the full treatment.
+        self.assertEqual(progress_only_ids, {"tt23112594"})
 
     async def test_series_records_use_cinemeta_episode_order_and_progress(self) -> None:
         videos = [
@@ -410,6 +441,118 @@ class StremioSyncTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(progress, [])
         self.assertEqual(len(clears), 1)
         self.assertNotIn("keep_season", clears[0])
+
+    def _visionquest(self, **overrides) -> dict:
+        # Real values from a Stremio library: last watched 2026-10-22,
+        # S1E5/E6 released 2026-10-28 05:00Z, S1E7 still upcoming.
+        item = {
+            "_id": "tt23112594",
+            "type": "series",
+            "removed": False,
+            "temp": False,
+            "_mtime": "2026-10-22T19:49:52.927Z",
+            "state": {"video_id": "tt23112594:1:5", "timeOffset": 1, "lastWatched": "2026-10-22T19:49:52.253Z"},
+        }
+        return {**item, **overrides}
+
+    _VISIONQUEST_VIDEOS = [
+        {"id": "tt23112594:1:4", "season": 1, "episode": 4, "released": "2026-10-21T05:00:00.000Z"},
+        {"id": "tt23112594:1:6", "season": 1, "episode": 6, "released": "2026-10-28T05:00:00.000Z"},
+        {"id": "tt23112594:1:5", "season": 1, "episode": 5, "released": "2026-10-28T05:00:00.000Z"},
+        {"id": "tt23112594:1:7", "season": 1, "episode": 7, "released": "2026-11-04T05:00:00.000Z"},
+    ]
+    _NOW_MS = 1793167200000  # 2026-10-28T06:00:00Z
+
+    def test_notifications_are_released_after_last_watch_and_not_in_future(self) -> None:
+        notified = _stremio_notified_videos(self._visionquest(), self._VISIONQUEST_VIDEOS, self._NOW_MS)
+        self.assertEqual([video["id"] for video in notified], ["tt23112594:1:5", "tt23112594:1:6"])
+
+    def test_no_notifications_outside_stremios_rules(self) -> None:
+        state = self._visionquest()["state"]
+        for name, item in [
+            ("temp item", self._visionquest(removed=True, temp=True)),
+            ("noNotif", self._visionquest(state={**state, "noNotif": True})),
+            ("defaultVideoId", self._visionquest(behaviorHints={"defaultVideoId": "tt23112594:1:1"})),
+            ("never watched", self._visionquest(state={**state, "lastWatched": None})),
+            ("movie", self._visionquest(type="movie")),
+        ]:
+            with self.subTest(name):
+                self.assertEqual(_stremio_notified_videos(item, self._VISIONQUEST_VIDEOS, self._NOW_MS), [])
+
+    def _library_series(self, **state) -> dict:
+        return {
+            "_id": "tt23112594",
+            "type": "series",
+            "name": "VisionQuest",
+            "removed": False,
+            "temp": False,
+            "_mtime": "2021-01-01T00:00:00Z",
+            "state": {"video_id": "tt23112594:1:4", "lastWatched": "2021-01-01T00:00:00Z", **state},
+        }
+
+    _OLD_RELEASES = [
+        {"id": "tt23112594:1:5", "season": 1, "episode": 5, "released": "2022-01-01T00:00:00Z"},
+        {"id": "tt23112594:1:6", "season": 1, "episode": 6, "released": "2022-01-08T00:00:00Z"},
+        {"id": "tt23112594:1:7", "season": 1, "episode": 7, "released": "2999-01-01T00:00:00Z"},
+    ]
+
+    async def test_new_episode_ranks_series_in_continue_watching(self) -> None:
+        self.last_videos.return_value = {"tt23112594": self._OLD_RELEASES}
+        item = self._library_series(video_id="tt23112594:1:5", timeOffset=1, duration=2_889_344)
+
+        library, watched_records, progress, clears, removed = await _stremio_records([item])
+
+        [record] = progress
+        self.assertEqual((record["season"], record["episode"], record["position"]), (1, 5, 1))
+        self.assertTrue(record["notified"])
+        self.assertEqual(record["sort_at"], 1641600000000)  # newest notification, 2022-01-08
+        self.assertEqual(self.last_videos.await_args.args[0], ["tt23112594"])
+
+    async def test_series_with_only_new_episodes_is_mirrored_at_zero(self) -> None:
+        self.last_videos.return_value = {"tt23112594": self._OLD_RELEASES}
+        item = self._library_series(timeOffset=0)
+
+        library, watched_records, progress, clears, removed = await _stremio_records([item])
+
+        [record] = progress
+        self.assertEqual((record["season"], record["episode"]), (1, 5))
+        self.assertEqual((record["position"], record["duration"]), (0, 0))
+        self.assertTrue(record["notified"])
+        self.assertEqual([(c.get("keep_season"), c.get("keep_episode")) for c in clears], [(1, 5)])
+
+    async def test_series_without_notifications_or_offset_is_cleared(self) -> None:
+        item = self._library_series(timeOffset=0)
+
+        library, watched_records, progress, clears, removed = await _stremio_records([item])
+
+        self.assertEqual(progress, [])
+        self.assertEqual(len(clears), 1)
+        self.assertNotIn("keep_season", clears[0])
+
+    async def test_unreachable_cinemeta_leaves_notification_rows_alone(self) -> None:
+        self.last_videos.side_effect = stremio.StremioAPIError("down")
+        idle = self._library_series(timeOffset=0)
+        resuming = {**self._library_series(video_id="tt0944947:1:2", timeOffset=600_000, duration=3_600_000),
+                    "_id": "tt0944947"}
+
+        library, watched_records, progress, clears, removed = await _stremio_records([idle, resuming])
+
+        # The idle series' membership depends on notifications: no record, no clear.
+        self.assertEqual([c["content_id"] for c in clears], ["tt0944947"])
+        [record] = progress
+        self.assertEqual(record["content_id"], "tt0944947")
+        self.assertNotIn("sort_at", record)
+
+    async def test_progress_only_items_skip_library_and_watched_records(self) -> None:
+        item = {**self._library_series(timeOffset=1, duration=100, video_id="tt23112594:1:5",
+                                       watched="tt23112594:1:1:1:eJwDAAAAAAE="), "removed": True, "temp": True}
+
+        library, watched_records, progress, clears, removed = await _stremio_records(
+            [item], progress_only_ids={"tt23112594"},
+        )
+
+        self.assertEqual((library, watched_records, removed), ([], [], set()))
+        self.assertEqual(len(progress), 1)
 
     def test_noop_comparison_ignores_only_mtime(self) -> None:
         left = {"_id": "tt0133093", "_mtime": "old", "state": {"timeOffset": 42}, "custom": True}
@@ -701,6 +844,9 @@ class StremioDismissTests(unittest.IsolatedAsyncioTestCase):
         self.Session = async_sessionmaker(self.engine, expire_on_commit=False)
         self.addAsyncCleanup(self.engine.dispose)
         self.connection = SimpleNamespace(id=48, token="auth-key")
+        patcher = patch.object(stremio, "get_cinemeta_last_videos", AsyncMock(return_value={}))
+        self.last_videos = patcher.start()
+        self.addCleanup(patcher.stop)
 
     async def _movie(self, db) -> Media:
         movie = Media(
@@ -793,6 +939,48 @@ class StremioDismissTests(unittest.IsolatedAsyncioTestCase):
         [pushed] = datastore_put.await_args.args[1]
         self.assertEqual(pushed["_id"], "tmdb:1399")
         self.assertEqual(pushed["state"]["timeOffset"], 0)
+
+    async def test_dismissing_new_episode_entry_retires_its_notifications(self) -> None:
+        """Stremio's own dismiss: RewindLibraryItem + DismissNotificationItem."""
+        async with self.Session() as db:
+            episode = await self._episode(db, 1, 5)
+            self.last_videos.return_value = {"tt0944947": [
+                {"id": "tt0944947:1:5", "season": 1, "episode": 5, "released": "2022-01-01T00:00:00Z"},
+            ]}
+            remote = {
+                "_id": "tt0944947",
+                "type": "series",
+                "removed": False,
+                "temp": False,
+                "state": {"video_id": "tt0944947:1:4", "timeOffset": 0, "lastWatched": "2021-01-01T00:00:00Z"},
+            }
+
+            datastore_put = await self._rewind(db, episode, [remote])
+
+        [pushed] = datastore_put.await_args.args[1]
+        self.assertEqual(pushed["state"]["timeOffset"], 0)
+        self.assertGreater(pushed["state"]["lastWatched"], "2026-")
+        self.assertEqual(pushed["state"]["video_id"], "tt0944947:1:4")
+
+    async def test_resumable_series_with_notifications_gets_both(self) -> None:
+        async with self.Session() as db:
+            episode = await self._episode(db, 1, 5)
+            self.last_videos.return_value = {"tt0944947": [
+                {"id": "tt0944947:1:6", "season": 1, "episode": 6, "released": "2022-01-01T00:00:00Z"},
+            ]}
+            remote = {
+                "_id": "tt0944947",
+                "type": "series",
+                "removed": False,
+                "temp": False,
+                "state": {"video_id": "tt0944947:1:5", "timeOffset": 1, "lastWatched": "2021-01-01T00:00:00Z"},
+            }
+
+            datastore_put = await self._rewind(db, episode, [remote])
+
+        [pushed] = datastore_put.await_args.args[1]
+        self.assertEqual(pushed["state"]["timeOffset"], 0)
+        self.assertGreater(pushed["state"]["lastWatched"], "2026-")
 
     async def test_dismiss_endpoint_rewinds_stremio_and_survives_failure(self) -> None:
         async with self.Session() as db:

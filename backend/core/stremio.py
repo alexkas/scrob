@@ -172,6 +172,25 @@ async def get_cinemeta_series(imdb_id: str) -> dict[str, Any]:
     return meta
 
 
+async def get_cinemeta_last_videos(imdb_ids: list[str]) -> dict[str, list[dict[str, Any]]]:
+    """Cinemeta's last-videos catalog: each series' recent episodes, without
+    specials. stremio-core builds its new-episode notifications from this,
+    not from the full series meta."""
+    if not imdb_ids:
+        return {}
+    async with httpx.AsyncClient(timeout=_TIMEOUT, follow_redirects=True) as client:
+        response = await client.get(
+            f"{CINEMETA_URL}/catalog/series/last-videos/lastVideosIds={','.join(imdb_ids)}.json"
+        )
+    payload = await _json(response, "Cinemeta last videos")
+    metas = (payload.get("metasDetailed") or payload.get("metas") or []) if isinstance(payload, dict) else []
+    return {
+        str(meta["id"]): [video for video in (meta.get("videos") or []) if isinstance(video, dict)]
+        for meta in metas
+        if isinstance(meta, dict) and meta.get("id")
+    }
+
+
 def decode_watched_bitfield(serialized: str | None, video_ids: list[str]) -> set[str]:
     if not serialized or not video_ids:
         return set()

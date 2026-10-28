@@ -711,7 +711,12 @@ async def get_continue_watching(
         .join(Media, Media.id == PlaybackProgress.media_id)
         .options(selectinload(PlaybackProgress.media).selectinload(Media.show))
         .where(*filters)
-        .order_by(desc(PlaybackProgress.updated_at))
+        # sort_at (Stremio's own ranking) counts until something newer
+        # updates the row; a NULL sort_at compares false and falls through.
+        .order_by(desc(case(
+            (PlaybackProgress.sort_at > PlaybackProgress.updated_at, PlaybackProgress.sort_at),
+            else_=PlaybackProgress.updated_at,
+        )))
     )
     if limit is not None:
         query = query.limit(limit)

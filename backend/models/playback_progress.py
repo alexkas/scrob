@@ -21,6 +21,10 @@ class PlaybackProgress(Base):
     progress_percent : Mapped[float]          = mapped_column(Float, default=0.0, nullable=False)
     progress_seconds : Mapped[int]            = mapped_column(Integer, default=0, nullable=False)
     updated_at       : Mapped[datetime]       = mapped_column(DateTime, default=utcnow, onupdate=utcnow, nullable=False)
+    # Continue Watching rank when it differs from updated_at: Stremio bumps a
+    # library series when a new episode is released. Kept apart from
+    # updated_at, which playback push sends back as Stremio's lastWatched.
+    sort_at          : Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
 
     user  : Mapped["User"]  = relationship()
     media : Mapped["Media"] = relationship()

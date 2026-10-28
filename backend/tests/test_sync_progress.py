@@ -279,11 +279,107 @@ class StremioProgressWindowTests(_TestDB):
             [row] = await self._apply(db, 3_500_000, mirror_all=True)
             self.assertGreater(row.progress_percent, 0.9)
 
+    async def test_stremio_sort_at_is_stored(self):
+        async with self.Session() as db:
+            await self._movie(db)
+            await _apply_nuvio_progress(
+                db, 1,
+                [{
+                    "content_id": "tt0133093", "content_type": "movie", "position": 600_000, "duration": 3_600_000,
+                    "last_watched": 1792698592253, "sort_at": 1793163600000,
+                }],
+                {}, {"tt0133093": 603},
+                mirror_all=True,
+            )
+            [row] = (await db.execute(select(PlaybackProgress))).scalars().all()
+            self.assertEqual(row.sort_at, datetime(2026, 10, 28, 5, 0))
+            self.assertEqual(row.updated_at, datetime(2026, 10, 22, 19, 49, 52, 253000))
+
+    async def test_repull_keeps_stremio_last_watched(self):
+        """Re-pulling an unchanged item with a new sort_at must not stamp the
+        sync time into updated_at (the column has onupdate=utcnow)."""
+        async with self.Session() as db:
+            await self._movie(db)
+            row = {
+                "content_id": "tt0133093", "content_type": "movie", "position": 600_000, "duration": 3_600_000,
+                "last_watched": 1792698592253, "sort_at": 1792698592927,
+            }
+            await _apply_nuvio_progress(db, 1, [row], {}, {"tt0133093": 603}, mirror_all=True)
+            await _apply_nuvio_progress(
+                db, 1, [{**row, "sort_at": 1793163600000}], {}, {"tt0133093": 603}, mirror_all=True,
+            )
+            db.expire_all()
+            [stored] = (await db.execute(select(PlaybackProgress))).scalars().all()
+            self.assertEqual(stored.updated_at, datetime(2026, 10, 22, 19, 49, 52, 253000))
+            self.assertEqual(stored.sort_at, datetime(2026, 10, 28, 5, 0))
+
     async def test_default_window_still_drops_low_progress(self):
         """Nuvio keeps the 5-90% window."""
         async with self.Session() as db:
             await self._movie(db)
             self.assertEqual(await self._apply(db, 1), [])
+
+
+class ContinueWatchingOrderTests(_TestDB):
+    """Continue Watching ranks by the later of sort_at and updated_at."""
+
+    async def test_new_release_bump_outranks_newer_watch(self):
+        from types import SimpleNamespace
+        from routers.history import get_continue_watching
+
+        async with self.Session() as db:
+            bumped, recent, plain = (
+                Media(tmdb_id=n, media_type=MediaType.movie, title=title)
+                for n, title in ((1, "VisionQuest"), (2, "Crystal Lake"), (3, "The Invite"))
+            )
+            db.add_all([bumped, recent, plain])
+            await db.flush()
+            db.add_all([
+                # Watched Oct 22, new episode released Oct 28 05:00.
+                PlaybackProgress(user_id=1, media_id=bumped.id, progress_percent=0.0, progress_seconds=0,
+                                 updated_at=datetime(2026, 10, 22, 19, 49), sort_at=datetime(2026, 10, 28, 5, 0)),
+                PlaybackProgress(user_id=1, media_id=recent.id, progress_percent=0.3, progress_seconds=700,
+                                 updated_at=datetime(2026, 10, 28, 3, 57)),
+                # A stale sort_at never pulls a row below its own newer watch.
+                PlaybackProgress(user_id=1, media_id=plain.id, progress_percent=0.7, progress_seconds=4700,
+                                 updated_at=datetime(2026, 10, 27, 5, 27), sort_at=datetime(2026, 1, 1)),
+            ])
+            await db.commit()
+
+            result = await get_continue_watching(
+                limit=20, include_hidden=False, db=db, current_user=SimpleNamespace(id=1),
+            )
+
+        self.assertEqual(
+            [item["media"]["title"] for item in result["continue_watching"]],
+            ["VisionQuest", "Crystal Lake", "The Invite"],
+        )
+
+
+class StremioLibrarySeriesIdsTests(_TestDB):
+    async def test_returns_stremio_library_series_for_this_connection(self):
+        from routers.sync import _stremio_library_series_ids
+
+        async with self.Session() as db:
+            for tmdb_id, source_id, media_type in (
+                (1399, "2:tt0944947", MediaType.series),
+                (1400, "2:tt0000002", MediaType.series),
+                (603, "2:tt0133093", MediaType.movie),   # a movie is never notified
+                (1401, "9:tt0000003", MediaType.series),  # another connection
+            ):
+                media = Media(tmdb_id=tmdb_id, media_type=media_type, title=source_id)
+                db.add(media)
+                await db.flush()
+                collection = Collection(user_id=1, media_id=media.id)
+                db.add(collection)
+                await db.flush()
+                db.add(CollectionFile(collection_id=collection.id, source=CollectionSource.stremio,
+                                      source_id=source_id, connection_id=int(source_id.split(":")[0])))
+            await db.commit()
+
+            ids = await _stremio_library_series_ids(db, 1, 2)
+
+        self.assertEqual(ids, {"tt0944947", "tt0000002"})
 
 
 class SyncItemsBatchBoundarySkipTests(_TestDB):
