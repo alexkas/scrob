@@ -25,6 +25,7 @@ from routers.sync import (
     _apply_nuvio_progress,
     _apply_nuvio_watch_history,
     _apply_stremio_progress_clears,
+    _drop_shadowed_stremio_clears,
     _expand_multi_episode_items,
 )
 
@@ -226,6 +227,63 @@ class StremioProgressClearTests(_TestDB):
 
             self.assertEqual(deleted, 0)
             self.assertEqual((await db.execute(select(Show))).scalars().all(), [])
+
+    def test_stale_duplicate_entry_does_not_clear_active_title(self):
+        """Euphoria lives in Stremio as tt8772296 (in Continue Watching) and as
+        a stale tmdb:85552 at timeOffset 0; both resolve to the same show."""
+        tmdb_ids = {"tt8772296": 85552, "tmdb:85552": 85552, "tt0133093": 603}
+        keep = {"content_id": "tt8772296", "content_type": "series", "cleared_at": 1, "keep_season": 3, "keep_episode": 2}
+        stale = {"content_id": "tmdb:85552", "content_type": "series", "cleared_at": 1}
+        unrelated = {"content_id": "tt0133093", "content_type": "movie", "cleared_at": 1}
+
+        self.assertEqual(
+            _drop_shadowed_stremio_clears([], [keep, stale, unrelated], tmdb_ids),
+            [keep, unrelated],
+        )
+
+    def test_movie_progress_shadows_stale_duplicate_clear(self):
+        tmdb_ids = {"tt14173636": 1, "tmdb:1": 1}
+        progress = [{"content_id": "tt14173636", "content_type": "movie", "position": 10, "duration": 100}]
+        stale = {"content_id": "tmdb:1", "content_type": "movie", "cleared_at": 1}
+
+        self.assertEqual(_drop_shadowed_stremio_clears(progress, [stale], tmdb_ids), [])
+
+
+class StremioProgressWindowTests(_TestDB):
+    """Stremio mirrors Continue Watching, so progress outside 5-90% is kept."""
+
+    async def _apply(self, db, position: int, **kwargs) -> list[PlaybackProgress]:
+        await _apply_nuvio_progress(
+            db, 1,
+            [{"content_id": "tt0133093", "content_type": "movie", "position": position, "duration": 3_600_000}],
+            {}, {"tt0133093": 603},
+            **kwargs,
+        )
+        return (await db.execute(select(PlaybackProgress))).scalars().all()
+
+    async def _movie(self, db) -> Media:
+        movie = Media(tmdb_id=603, media_type=MediaType.movie, title="The Matrix")
+        db.add(movie)
+        await db.commit()
+        return movie
+
+    async def test_next_episode_marker_is_kept_when_mirroring(self):
+        async with self.Session() as db:
+            await self._movie(db)
+            [row] = await self._apply(db, 1, mirror_all=True)
+            self.assertEqual(row.progress_seconds, 0)
+
+    async def test_nearly_finished_is_kept_when_mirroring(self):
+        async with self.Session() as db:
+            await self._movie(db)
+            [row] = await self._apply(db, 3_500_000, mirror_all=True)
+            self.assertGreater(row.progress_percent, 0.9)
+
+    async def test_default_window_still_drops_low_progress(self):
+        """Nuvio keeps the 5-90% window."""
+        async with self.Session() as db:
+            await self._movie(db)
+            self.assertEqual(await self._apply(db, 1), [])
 
 
 class SyncItemsBatchBoundarySkipTests(_TestDB):

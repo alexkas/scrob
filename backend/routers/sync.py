@@ -4648,7 +4648,15 @@ async def _apply_nuvio_progress(
     rows: list[dict],
     show_map: dict[str, int],
     tmdb_ids: dict[str, int],
+    *,
+    mirror_all: bool = False,
 ) -> None:
+    """Upsert progress rows inside the 5-90% window and drop the rest.
+
+    mirror_all keeps every row with a position instead (Stremio): its
+    records only exist while the item is in Stremio's Continue Watching,
+    which includes a just-started episode and the "next episode" marker
+    (timeOffset 1ms)."""
     movie_tmdb_ids = {
         tmdb_id
         for row in rows
@@ -4722,7 +4730,8 @@ async def _apply_nuvio_progress(
             continue
         progress_percent = min(1.0, position_ms / duration_ms)
         progress = existing.get(media.id)
-        if 0.05 <= progress_percent < 0.90:
+        in_window = position_ms > 0 if mirror_all else 0.05 <= progress_percent < 0.90
+        if in_window:
             updated_at = _nuvio_datetime(row.get("last_watched")) or utcnow()
             if progress:
                 progress.progress_percent = progress_percent
@@ -5238,6 +5247,26 @@ async def _stremio_records(
     return library_records, watched_records, progress_records, progress_clears, removed_ids
 
 
+def _drop_shadowed_stremio_clears(
+    progress_records: list[dict],
+    progress_clears: list[dict],
+    tmdb_ids: dict[str, int],
+) -> list[dict]:
+    """Stremio can hold one title under several ids (tt..., tmdb:..., left
+    over from different catalogs). A stale duplicate at timeOffset 0 must not
+    clear the title while another of its entries is in Continue Watching."""
+    def title_key(record: dict) -> tuple[str, int | None]:
+        return str(record.get("content_type")), tmdb_ids.get(str(record.get("content_id") or ""))
+
+    active = {title_key(record) for record in progress_records}
+    active |= {title_key(clear) for clear in progress_clears if "keep_season" in clear}
+    return [
+        clear
+        for clear in progress_clears
+        if "keep_season" in clear or title_key(clear) not in active or title_key(clear)[1] is None
+    ]
+
+
 async def _apply_stremio_progress_clears(
     db: AsyncSession,
     user_id: int,
@@ -5597,7 +5626,8 @@ async def _run_stremio_sync(
                     )
                 )
             if progress_records:
-                await _apply_nuvio_progress(db, user_id, progress_records, show_map, tmdb_ids)
+                await _apply_nuvio_progress(db, user_id, progress_records, show_map, tmdb_ids, mirror_all=True)
+            progress_clears = _drop_shadowed_stremio_clears(progress_records, progress_clears, tmdb_ids)
             # After the upserts, so a series' current episode is already
             # written when its other episodes are cleared.
             if progress_clears:
