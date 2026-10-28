@@ -751,7 +751,40 @@ async def dismiss_continue_watching(
         )
     )
     await db.commit()
+    await _push_continue_watching_dismissal(db, current_user.id, media_id)
     return {"status": "ok"}
+
+
+async def _push_continue_watching_dismissal(db: AsyncSession, user_id: int, media_id: int) -> None:
+    """Rewind the dismissed item in Stremio so it leaves Continue Watching there
+    too. Without this, Stremio still has the position and the next pull (or a
+    playback push from the other direction) brings the row straight back."""
+    conns_result = await db.execute(
+        select(MediaServerConnection).where(
+            MediaServerConnection.user_id == user_id,
+            MediaServerConnection.type == "stremio",
+        )
+    )
+    stremio_connections = conns_result.scalars().all()
+    if not stremio_connections:
+        return
+    media = await db.get(Media, media_id)
+    # Same exclusion as _push_watch_state: a TVDB-only episode has no id
+    # Stremio can match (#101).
+    if media is None or is_unmapped_tvdb_episode(media):
+        return
+
+    from routers.sync import _get_effective_tmdb_key, _rewind_stremio_progress
+
+    settings_result = await db.execute(select(UserSettings).where(UserSettings.user_id == user_id))
+    api_key = await _get_effective_tmdb_key(db, settings_result.scalar_one_or_none())
+    for conn in stremio_connections:
+        try:
+            await _rewind_stremio_progress(db, conn, media_ids={media_id}, api_key=api_key)
+        except Exception as e:
+            logger.warning("Can't clear Continue Watching in Stremio (connection %s) because %s", conn.id, e)
+    # _stremio_media_records may have backfilled IMDb ids onto the media rows.
+    await db.commit()
 
 
 def _format_media_item(media: Media) -> dict:

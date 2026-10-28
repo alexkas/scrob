@@ -6562,6 +6562,71 @@ async def _stremio_changed_content_ids(
     }
 
 
+async def _rewind_stremio_progress(
+    db: AsyncSession,
+    conn: MediaServerConnection,
+    *,
+    media_ids: set[int],
+    api_key: str | None,
+) -> int:
+    """Drop items dismissed in Scrob from Stremio's Continue Watching.
+
+    Mirrors stremio-core's RewindLibraryItem: only `timeOffset` goes to 0 and
+    the rest of the current remote record is kept. A series is rewound only
+    while Stremio's current `video_id` is the dismissed episode - dismissing a
+    stale episode must not drop the one Stremio is actually on. Returns the
+    number of items written."""
+    records = await _stremio_media_records(db, media_ids, api_key)
+    if not records:
+        return 0
+    media_rows = await _select_in_chunks(
+        db,
+        lambda chunk: select(Media).where(Media.id.in_(chunk)),
+        list(records),
+    )
+    show_ids = {media.show_id for media in media_rows if media.show_id is not None}
+    show_tmdb_ids: dict[int, int | None] = {}
+    if show_ids:
+        shows = await _select_in_chunks(
+            db,
+            lambda chunk: select(Show).where(Show.id.in_(chunk)),
+            list(show_ids),
+        )
+        show_tmdb_ids = {show.id: show.tmdb_id for show in shows}
+
+    # Stremio keys an item by whichever catalog added it: IMDb or tmdb:<id>.
+    targets: dict[str, tuple[int, int] | None] = {}
+    for media in media_rows:
+        record = records.get(media.id)
+        if record is None:
+            continue
+        is_episode = record["content_type"] == "series" and record.get("season") is not None
+        episode = (int(record["season"]), int(record["episode"])) if is_episode else None
+        tmdb_id = show_tmdb_ids.get(media.show_id) if media.show_id is not None else media.tmdb_id
+        for content_id in (record["content_id"], f"tmdb:{tmdb_id}" if tmdb_id else None):
+            if content_id:
+                targets[content_id] = episode
+
+    lock = _stremio_push_locks.setdefault(conn.id, asyncio.Lock())
+    async with lock:
+        remote_items = await stremio.datastore_get(conn.token, ids=sorted(targets))
+        now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        changes = []
+        for item in remote_items:
+            content_id = str(item.get("_id") or "")
+            if content_id not in targets:
+                continue
+            state = item.get("state") if isinstance(item.get("state"), dict) else {}
+            if not state.get("timeOffset"):
+                continue
+            episode = targets[content_id]
+            if episode is not None and _stremio_video_parts({"id": state.get("video_id")}) != episode:
+                continue
+            changes.append({**item, "state": {**state, "timeOffset": 0}, "_mtime": now})
+        await stremio.datastore_put(conn.token, changes)
+    return len(changes)
+
+
 async def _push_stremio_connection(
     db: AsyncSession,
     conn: MediaServerConnection,

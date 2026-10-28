@@ -11,20 +11,36 @@ from fastapi import HTTPException
 os.environ.setdefault("SECRET_KEY", "test-secret")
 os.environ.setdefault("DATABASE_URL", "postgresql+asyncpg://test:test@localhost/test")
 
+from sqlalchemy import select
+from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+from sqlalchemy.ext.compiler import compiles
+from sqlalchemy.pool import StaticPool
+
 from core import stremio
 from models.base import MediaType
+from models.connections import MediaServerConnection
 from models.media import Media
+from models.playback_progress import PlaybackProgress
+from models.show import Show
 from schemas import MediaServerConnectionResponse, StremioLinkPollRequest
 from routers import auth
-from routers.history import _push_watch_state
+from routers.history import _push_watch_state, dismiss_continue_watching
 from routers.sync import (
     _apply_nuvio_watch_history,
     _pull_stremio_items,
     _push_stremio_connection,
+    _rewind_stremio_progress,
     _stremio_records,
     _stremio_same_item,
     _stremio_sorted_videos,
 )
+
+
+@compiles(JSONB, "sqlite")
+def _jsonb_as_json_on_sqlite(type_, compiler, **kw):
+    """JSONB is PostgreSQL-only and has no SQLite rendering of its own."""
+    return "JSON"
 
 
 _REAL_ASYNC_CLIENT = httpx.AsyncClient
@@ -668,6 +684,134 @@ class StremioSyncTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(pushed["temp"])
         self.assertEqual(pushed["state"]["timeOffset"], 120_000)
         self.assertEqual(pushed["state"]["duration"], 600_000)
+
+
+class StremioDismissTests(unittest.IsolatedAsyncioTestCase):
+    """Dismissing in Scrob rewinds the item in Stremio (timeOffset = 0)."""
+
+    async def asyncSetUp(self) -> None:
+        import models  # noqa: F401 - registers every table on Base.metadata
+        from models.base import Base
+
+        self.engine = create_async_engine(
+            "sqlite+aiosqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool,
+        )
+        async with self.engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+        self.Session = async_sessionmaker(self.engine, expire_on_commit=False)
+        self.addAsyncCleanup(self.engine.dispose)
+        self.connection = SimpleNamespace(id=48, token="auth-key")
+
+    async def _movie(self, db) -> Media:
+        movie = Media(
+            tmdb_id=603, media_type=MediaType.movie, title="The Matrix", tmdb_data={"imdb_id": "tt0133093"},
+        )
+        db.add(movie)
+        await db.commit()
+        return movie
+
+    async def _episode(self, db, season: int, episode: int) -> Media:
+        show = Show(tmdb_id=1399, title="Game of Thrones", tmdb_data={"external_ids": {"imdb_id": "tt0944947"}})
+        db.add(show)
+        await db.flush()
+        media = Media(
+            tmdb_id=63056, media_type=MediaType.episode, title="Episode", show_id=show.id,
+            season_number=season, episode_number=episode,
+        )
+        db.add(media)
+        await db.commit()
+        return media
+
+    async def _rewind(self, db, media: Media, remote: list[dict]) -> AsyncMock:
+        datastore_put = AsyncMock()
+        with (
+            patch.object(stremio, "datastore_get", AsyncMock(return_value=remote)),
+            patch.object(stremio, "datastore_put", datastore_put),
+        ):
+            await _rewind_stremio_progress(db, self.connection, media_ids={media.id}, api_key="tmdb-key")
+        return datastore_put
+
+    async def test_movie_rewind_zeroes_offset_and_keeps_unknown_fields(self) -> None:
+        async with self.Session() as db:
+            movie = await self._movie(db)
+            remote = {
+                "_id": "tt0133093",
+                "type": "movie",
+                "custom": {"kept": True},
+                "state": {"timeOffset": 600_000, "duration": 8_160_000, "timesWatched": 2},
+            }
+
+            datastore_put = await self._rewind(db, movie, [remote])
+
+        [pushed] = datastore_put.await_args.args[1]
+        self.assertEqual(pushed["state"]["timeOffset"], 0)
+        self.assertEqual(pushed["state"]["duration"], 8_160_000)
+        self.assertEqual(pushed["state"]["timesWatched"], 2)
+        self.assertEqual(pushed["custom"], {"kept": True})
+        self.assertNotEqual(pushed.get("_mtime"), None)
+
+    async def test_already_rewound_item_is_not_written(self) -> None:
+        async with self.Session() as db:
+            movie = await self._movie(db)
+            remote = {"_id": "tt0133093", "type": "movie", "state": {"timeOffset": 0}}
+
+            datastore_put = await self._rewind(db, movie, [remote])
+
+        self.assertEqual(datastore_put.await_args.args[1], [])
+
+    async def test_episode_rewind_only_when_it_is_stremios_current_video(self) -> None:
+        async with self.Session() as db:
+            episode = await self._episode(db, 1, 3)
+            remote = {
+                "_id": "tt0944947",
+                "type": "series",
+                "state": {"video_id": "tt0944947:1:4", "timeOffset": 120_000},
+            }
+
+            datastore_put = await self._rewind(db, episode, [remote])
+
+        # Stremio has already moved on to S1E4; dismissing S1E3 must not rewind it.
+        self.assertEqual(datastore_put.await_args.args[1], [])
+
+    async def test_episode_rewind_matches_tmdb_catalog_item(self) -> None:
+        async with self.Session() as db:
+            episode = await self._episode(db, 1, 4)
+            remote = {
+                "_id": "tmdb:1399",
+                "type": "series",
+                "state": {"video_id": "tt0944947:1:4", "timeOffset": 120_000},
+            }
+            datastore_get = AsyncMock(return_value=[remote])
+            datastore_put = AsyncMock()
+            with (
+                patch.object(stremio, "datastore_get", datastore_get),
+                patch.object(stremio, "datastore_put", datastore_put),
+            ):
+                await _rewind_stremio_progress(db, self.connection, media_ids={episode.id}, api_key="tmdb-key")
+
+        self.assertEqual(datastore_get.await_args.kwargs["ids"], ["tmdb:1399", "tt0944947"])
+        [pushed] = datastore_put.await_args.args[1]
+        self.assertEqual(pushed["_id"], "tmdb:1399")
+        self.assertEqual(pushed["state"]["timeOffset"], 0)
+
+    async def test_dismiss_endpoint_rewinds_stremio_and_survives_failure(self) -> None:
+        async with self.Session() as db:
+            movie = await self._movie(db)
+            db.add(MediaServerConnection(user_id=7, type="stremio", name="Stremio", url="", token="auth-key"))
+            db.add(PlaybackProgress(user_id=7, media_id=movie.id, progress_percent=0.4, progress_seconds=600))
+            await db.commit()
+            rewind = AsyncMock(side_effect=stremio.StremioAPIError("down"))
+            with (
+                patch("routers.sync._rewind_stremio_progress", rewind),
+                patch("routers.sync._get_effective_tmdb_key", AsyncMock(return_value="tmdb-key")),
+            ):
+                result = await dismiss_continue_watching(
+                    media_id=movie.id, db=db, current_user=SimpleNamespace(id=7),
+                )
+
+            self.assertEqual(result, {"status": "ok"})
+            self.assertEqual(rewind.await_args.kwargs["media_ids"], {movie.id})
+            self.assertEqual((await db.execute(select(PlaybackProgress))).scalars().all(), [])
 
 
 class StremioCompatibilityTests(unittest.IsolatedAsyncioTestCase):
