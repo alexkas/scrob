@@ -424,6 +424,7 @@ const discoverBackdropUrl = discoverPick?.backdrop_path
           const inLists = item.in_lists ?? [];
           const inLibrary = item.in_library ?? false;
           const collectionPct = item.collection_pct ?? (inLibrary ? 100 : 0);
+          const seriesInLibraryOnly = isSeries && (item.collected_as_series ?? false) && collectionPct === 0;
           const watchPct = item.watch_pct ?? (watched ? 100 : 0);
           const watchActive = isSeries ? watchPct > 0 : watched;
           const collectStyle = isSeries && collectionPct > 0
@@ -468,7 +469,7 @@ const discoverBackdropUrl = discoverPick?.backdrop_path
                 <span class="text-[8px] font-bold uppercase tracking-wider leading-none">Lists</span>
               </button>
               <button data-action="collected" data-in-library="${inLibrary}" data-collection-pct="${collectionPct}" data-state="${(inLibrary || collectionPct > 0) ? 'active' : 'inactive'}"
-                title="${isSeries ? `${collectionPct}% in library` : (inLibrary ? 'In collection' : 'Add to collection')}"
+                title="${seriesInLibraryOnly ? 'In library' : isSeries ? `${collectionPct}% in library` : (inLibrary ? 'In collection' : 'Add to collection')}"
                 style="${esc(collectStyle)}"
                 class="relative flex flex-col items-center justify-center gap-1 py-2.5 transition-all cursor-pointer overflow-hidden hover:brightness-125 ${(inLibrary || collectionPct > 0) ? 'bg-purple-500/20 text-purple-400' : 'bg-zinc-900 text-zinc-400 hover:bg-purple-500/10 hover:text-purple-400'}">
                 <svg xmlns="http://www.w3.org/2000/svg" width="13" height="13" viewBox="0 0 24 24" fill="${collectedFill}" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -477,7 +478,7 @@ const discoverBackdropUrl = discoverPick?.backdrop_path
                   <path d="M15 22v-4a3 3 0 0 0-6 0v4"/>
                   <path d="M2 7h20"/>
                 </svg>
-                <span class="text-[8px] font-bold uppercase tracking-wider leading-none">${isSeries ? `${collectionPct}%` : 'Collected'}</span>
+                <span class="text-[8px] font-bold uppercase tracking-wider leading-none">${seriesInLibraryOnly ? '✓' : isSeries ? `${collectionPct}%` : 'Collected'}</span>
               </button>
             </div>` : ''}
             <a href="${esc(href)}" class="block p-3 bg-gradient-to-b from-zinc-900 to-zinc-950 flex-1">

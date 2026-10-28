@@ -817,6 +817,7 @@ const sonarrUrl = `${origin}/api/proxy/sonarr-compat/${list?.id}`;
     const collectionPct = media.collection_pct ?? (inLibrary ? 100 : 0);
     const watchPct = media.watch_pct ?? (watched ? 100 : 0);
     const isPercentageStyle = isSeries || isSeason;
+    const seriesInLibraryOnly = isPercentageStyle && (media.collected_as_series ?? false) && collectionPct === 0;
     const watchActive = isPercentageStyle ? watchPct > 0 : watched;
     const collectStyle = isPercentageStyle
       ? `background: linear-gradient(to right, rgba(168,85,247,0.2) ${collectionPct}%, transparent ${collectionPct}%)`
@@ -857,7 +858,7 @@ const sonarrUrl = `${origin}/api/proxy/sonarr-compat/${list?.id}`;
           data-in-library="${inLibrary}"
           data-collection-pct="${collectionPct}"
           data-state="${(inLibrary || collectionPct > 0) ? 'active' : 'inactive'}"
-          title="${isPercentageStyle ? `${collectionPct}% in library` : (inLibrary ? 'In collection' : 'Add to collection')}"
+          title="${seriesInLibraryOnly ? 'In library' : isPercentageStyle ? `${collectionPct}% in library` : (inLibrary ? 'In collection' : 'Add to collection')}"
           style="${esc(collectStyle)}"
           class="relative flex flex-col items-center justify-center gap-1 py-2.5 transition-all cursor-pointer overflow-hidden hover:brightness-125 ${(inLibrary || collectionPct > 0) ? 'bg-purple-500/20 text-purple-400' : 'bg-zinc-900 text-zinc-400 hover:bg-purple-500/10 hover:text-purple-400'}"
         >
@@ -866,7 +867,7 @@ const sonarrUrl = `${origin}/api/proxy/sonarr-compat/${list?.id}`;
             <path d="M4 12v8a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-8"/><path d="M15 22v-4a3 3 0 0 0-6 0v4"/>
             <path d="M2 7h20"/>
           </svg>
-          <span class="text-[8px] font-bold uppercase tracking-wider leading-none">${isPercentageStyle ? `${collectionPct}%` : 'Collected'}</span>
+          <span class="text-[8px] font-bold uppercase tracking-wider leading-none">${seriesInLibraryOnly ? '✓' : isPercentageStyle ? `${collectionPct}%` : 'Collected'}</span>
         </button>
       </div>` : '';
 

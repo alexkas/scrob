@@ -461,6 +461,10 @@ async def enrich_with_state(
     # --- Collection pct and watched status for shows ---
     show_pct: dict[int, int] = {}
     show_aired_count: dict[int, int] = {}
+    # Shows collected as a whole (a series-level Collection row, e.g. from the
+    # Stremio library) rather than episode by episode - see routers/shows.py
+    # list_shows, which already counts these as "in collection".
+    collected_as_series_ids: set[int] = set()
     if show_tmdb_ids:
         # Total episodes from TMDB metadata.
         # Check local DB first for existing show rows.
@@ -582,6 +586,18 @@ async def enrich_with_state(
             .group_by(ep_dedup_sq.c.show_tmdb_id)
         )
         collected_map = {r[0]: r[1] for r in collected_q.all()}
+
+        series_collected_q = await db.execute(
+            select(Media.tmdb_id)
+            .join(Collection, Collection.media_id == Media.id)
+            .where(
+                Collection.user_id == user_id,
+                Media.media_type == MediaType.series,
+                Media.tmdb_id.in_(show_tmdb_ids),
+            )
+            .distinct()
+        )
+        collected_as_series_ids = {r[0] for r in series_collected_q.all()}
 
         if season_items:
             season_collected_q = await db.execute(
@@ -764,7 +780,11 @@ async def enrich_with_state(
             item["watched"] = tid in watched_shows
             pct = show_pct.get(tid, 0)
             item["collection_pct"] = pct
-            item["in_library"] = pct > 0
+            # collection_pct stays the real episode percentage; a series-level
+            # row only flags the show as in the library.
+            as_series = tid in collected_as_series_ids
+            item["collected_as_series"] = as_series
+            item["in_library"] = pct > 0 or as_series
             _w = show_watched_count_map.get(tid, 0)
             _a = show_aired_count.get(tid, 0)
             item["watch_pct"] = min(100, int((_w / _a) * 100)) if _a > 0 else 0
@@ -3756,28 +3776,35 @@ async def uncollect_show(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Remove all collection entries for every episode in a show."""
-    show_q = await db.execute(select(ShowModel).where(ShowModel.tmdb_id == tmdb_id))
-    show = show_q.scalar_one_or_none()
-    if not show:
-        return {"status": "ok"}
-
-    episode_ids_q = await db.execute(
+    """Remove all collection entries for a show: every episode, plus the
+    series-level entry a show collected as a whole (e.g. from Stremio) has."""
+    series_ids_q = await db.execute(
         select(Media.id).where(
-            Media.show_id == show.id,
-            Media.media_type == MediaType.episode,
+            Media.tmdb_id == tmdb_id,
+            Media.media_type == MediaType.series,
         )
     )
-    episode_ids = [r[0] for r in episode_ids_q.all()]
-    if episode_ids:
+    media_ids = [r[0] for r in series_ids_q.all()]
+
+    show_q = await db.execute(select(ShowModel).where(ShowModel.tmdb_id == tmdb_id))
+    show = show_q.scalar_one_or_none()
+    if show:
+        episode_ids_q = await db.execute(
+            select(Media.id).where(
+                Media.show_id == show.id,
+                Media.media_type == MediaType.episode,
+            )
+        )
+        media_ids += [r[0] for r in episode_ids_q.all()]
+    if media_ids:
         await db.execute(
             sa_delete(Collection).where(
                 Collection.user_id == current_user.id,
-                Collection.media_id.in_(episode_ids),
+                Collection.media_id.in_(media_ids),
             )
         )
         await db.commit()
-        await _push_collection_change(db, current_user.id, set(episode_ids), added=False)
+        await _push_collection_change(db, current_user.id, set(media_ids), added=False)
     return {"status": "ok"}
 
 

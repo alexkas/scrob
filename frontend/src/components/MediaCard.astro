@@ -52,6 +52,7 @@ const inLists = item.in_lists ?? [];
 const collectionPct = item.collection_pct ?? (item.in_library ? 100 : 0);
 const watchPct = item.watch_pct ?? (item.watched ? 100 : 0);
 const inLibrary = item.in_library ?? false;
+const collectedAsSeries = item.collected_as_series ?? false;
 ---
 
 <div
@@ -143,6 +144,7 @@ const inLibrary = item.in_library ?? false;
       collectionPct={collectionPct}
       watchPct={watchPct}
       isSeries={isPercentageStyle}
+      collectedAsSeries={collectedAsSeries}
     />
   )}
 

@@ -251,3 +251,165 @@ class SearchMetadataLanguageTests(unittest.IsolatedAsyncioTestCase):
             with patch.object(media_router, "get_media_translations", AsyncMock(return_value=stored)):
                 result, _ = await self._search("fr", db=db)
         self.assertEqual(result["results"][0]["title"], "Surveillant (stocke)")
+
+
+from sqlalchemy import select as _sa_select
+from sqlalchemy.dialects.postgresql import JSONB as _JSONB
+from sqlalchemy.ext.asyncio import async_sessionmaker as _async_sessionmaker, create_async_engine as _create_async_engine
+from sqlalchemy.ext.compiler import compiles as _compiles
+from sqlalchemy.pool import StaticPool as _StaticPool
+
+from models.collection import Collection
+from models.media import Media
+from models.show import Show as ShowModel
+
+
+@_compiles(_JSONB, "sqlite")
+def _jsonb_as_json_on_sqlite(type_, compiler, **kw):  # pragma: no cover - dialect shim
+    return "JSON"
+
+
+class _CollectionDB(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self) -> None:
+        import models  # noqa: F401
+        from models.base import Base
+
+        self.engine = _create_async_engine(
+            "sqlite+aiosqlite://", connect_args={"check_same_thread": False}, poolclass=_StaticPool,
+        )
+        async with self.engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+        self.Session = _async_sessionmaker(self.engine, expire_on_commit=False)
+        self.addAsyncCleanup(self.engine.dispose)
+
+    async def _add_show(self, db, tmdb_id: int, episode_count: int = 10) -> ShowModel:
+        # "Ended" keeps enrich_with_state off its live TMDB aired-count lookup.
+        show = ShowModel(
+            tmdb_id=tmdb_id, title=f"Show {tmdb_id}", status="Ended",
+            tmdb_data={"seasons": [{"season_number": 1, "episode_count": episode_count}]},
+        )
+        db.add(show)
+        await db.flush()
+        return show
+
+
+class EnrichCollectedAsSeriesTests(_CollectionDB):
+    """A show collected as a whole (a series-level Collection row, as Stremio
+    library sync creates) is in the library even with no episodes collected -
+    list_shows already counts it, so its card mustn't read 0% / not in library."""
+
+    async def _enrich(self, db, items):
+        with patch.object(media_router, "check_tmdb_key", return_value=False):
+            return await media_router.enrich_with_state(db, 7, items)
+
+    async def test_series_level_row_only_is_in_library_at_zero_pct(self) -> None:
+        async with self.Session() as db:
+            await self._add_show(db, 100)
+            series = Media(tmdb_id=100, media_type=MediaType.series, title="Show 100")
+            db.add(series)
+            await db.flush()
+            db.add(Collection(user_id=7, media_id=series.id))
+            await db.commit()
+
+            [item] = await self._enrich(db, [{"tmdb_id": 100, "type": "series"}])
+
+        self.assertTrue(item["in_library"])
+        self.assertTrue(item["collected_as_series"])
+        self.assertEqual(item["collection_pct"], 0)
+
+    async def test_episode_collected_show_unchanged(self) -> None:
+        async with self.Session() as db:
+            show = await self._add_show(db, 200)
+            for ep in range(1, 6):
+                episode = Media(
+                    tmdb_id=2000 + ep, media_type=MediaType.episode, title=f"E{ep}",
+                    show_id=show.id, season_number=1, episode_number=ep,
+                )
+                db.add(episode)
+                await db.flush()
+                db.add(Collection(user_id=7, media_id=episode.id))
+            await db.commit()
+
+            [item] = await self._enrich(db, [{"tmdb_id": 200, "type": "series"}])
+
+        self.assertTrue(item["in_library"])
+        self.assertFalse(item["collected_as_series"])
+        self.assertEqual(item["collection_pct"], 50)
+
+    async def test_season_item_ignores_series_level_row(self) -> None:
+        async with self.Session() as db:
+            await self._add_show(db, 300)
+            series = Media(tmdb_id=300, media_type=MediaType.series, title="Show 300")
+            db.add(series)
+            await db.flush()
+            db.add(Collection(user_id=7, media_id=series.id))
+            await db.commit()
+
+            [item] = await self._enrich(db, [{"tmdb_id": 300, "type": "series", "season_number": 1}])
+
+        self.assertFalse(item["in_library"])
+        self.assertNotIn("collected_as_series", item)
+        self.assertEqual(item["collection_pct"], 0)
+
+    async def test_other_users_series_row_does_not_count(self) -> None:
+        async with self.Session() as db:
+            await self._add_show(db, 400)
+            series = Media(tmdb_id=400, media_type=MediaType.series, title="Show 400")
+            db.add(series)
+            await db.flush()
+            db.add(Collection(user_id=8, media_id=series.id))
+            await db.commit()
+
+            [item] = await self._enrich(db, [{"tmdb_id": 400, "type": "series"}])
+
+        self.assertFalse(item["in_library"])
+        self.assertFalse(item["collected_as_series"])
+
+
+class UncollectShowSeriesLevelTests(_CollectionDB):
+    """Removing a show from the collection must drop its series-level row too,
+    and push it, or a Stremio-collected show could never be uncollected."""
+
+    async def test_removes_series_and_episode_rows_and_pushes_both(self) -> None:
+        async with self.Session() as db:
+            show = await self._add_show(db, 500)
+            series = Media(tmdb_id=500, media_type=MediaType.series, title="Show 500")
+            episode = Media(
+                tmdb_id=5001, media_type=MediaType.episode, title="E1",
+                show_id=show.id, season_number=1, episode_number=1,
+            )
+            other = Media(tmdb_id=600, media_type=MediaType.series, title="Other")
+            db.add_all([series, episode, other])
+            await db.flush()
+            db.add_all([
+                Collection(user_id=7, media_id=series.id),
+                Collection(user_id=7, media_id=episode.id),
+                Collection(user_id=7, media_id=other.id),
+            ])
+            await db.commit()
+
+            push = AsyncMock()
+            with patch.object(media_router, "_push_collection_change", push):
+                await media_router.uncollect_show(tmdb_id=500, db=db, current_user=SimpleNamespace(id=7))
+
+            remaining = (await db.execute(_sa_select(Collection.media_id))).scalars().all()
+
+        self.assertEqual(remaining, [other.id])
+        push.assert_awaited_once()
+        self.assertEqual(push.await_args.args[2], {series.id, episode.id})
+        self.assertEqual(push.await_args.kwargs, {"added": False})
+
+    async def test_series_row_removed_without_local_show_row(self) -> None:
+        async with self.Session() as db:
+            series = Media(tmdb_id=700, media_type=MediaType.series, title="No Show Row")
+            db.add(series)
+            await db.flush()
+            db.add(Collection(user_id=7, media_id=series.id))
+            await db.commit()
+
+            with patch.object(media_router, "_push_collection_change", AsyncMock()):
+                await media_router.uncollect_show(tmdb_id=700, db=db, current_user=SimpleNamespace(id=7))
+
+            remaining = (await db.execute(_sa_select(Collection.media_id))).scalars().all()
+
+        self.assertEqual(remaining, [])

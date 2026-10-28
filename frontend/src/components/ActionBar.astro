@@ -6,6 +6,9 @@ interface Props {
   inLists: number[];
   inLibrary: boolean;
   collectionPct: number;
+  // Series only: collected as a whole show (e.g. from Stremio), so it is in
+  // the library even at 0% of episodes.
+  collectedAsSeries?: boolean;
   watchPct?: number;
   watchStarted?: boolean;
   showTmdbId?: number;
@@ -45,6 +48,7 @@ const {
   inLists,
   inLibrary,
   collectionPct,
+  collectedAsSeries = false,
   watchPct = 0,
   watchStarted = false,
   showTmdbId,
@@ -74,6 +78,7 @@ const {
 } = Astro.props;
 
 const isSeries = mediaType === "series";
+const seriesInLibraryOnly = isSeries && collectedAsSeries && collectionPct === 0;
 const showRequest = !hideRequest && requestEnabled && (mediaType === "movie" || mediaType === "series");
 const ratingLabel = userRating != null ? userRating.toFixed(1) : "Rate";
 
@@ -249,7 +254,7 @@ const dropTitle = dropped
         data-in-library={String(inLibrary)}
         data-collection-pct={String(collectionPct)}
         data-state={inLibrary ? "active" : "inactive"}
-        title={isSeries ? `${collectionPct}% in library` : (inLibrary ? "In collection" : "Add to collection")}
+        title={seriesInLibraryOnly ? "In library" : isSeries ? `${collectionPct}% in library` : (inLibrary ? "In collection" : "Add to collection")}
         class={`${btn} ${btnW} relative overflow-hidden ${collectedCls} ${showRequest ? "border-r border-zinc-800/60" : ""}`}
       >
         <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -258,8 +263,8 @@ const dropTitle = dropped
           <path d="M15 22v-4a3 3 0 0 0-6 0v4"/>
           <path d="M2 7h20"/>
         </svg>
-        <span class={label}>{isSeries ? `${collectionPct}%` : "Collected"}</span>
-        {isSeries && <span class="md:hidden text-[9px] font-bold leading-none">{collectionPct}%</span>}
+        <span class={label}>{seriesInLibraryOnly ? "In library" : isSeries ? `${collectionPct}%` : "Collected"}</span>
+        {isSeries && <span class="md:hidden text-[9px] font-bold leading-none">{seriesInLibraryOnly ? "✓" : `${collectionPct}%`}</span>}
       </button>
     )}
 

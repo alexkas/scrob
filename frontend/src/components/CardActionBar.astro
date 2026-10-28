@@ -6,12 +6,15 @@ interface Props {
   collectionPct: number;
   watchPct: number;
   isSeries: boolean;
+  collectedAsSeries?: boolean;
 }
 
-const { watched, inLists, inLibrary, collectionPct, watchPct, isSeries } = Astro.props;
+const { watched, inLists, inLibrary, collectionPct, watchPct, isSeries, collectedAsSeries = false } = Astro.props;
 
 const watchActive = isSeries ? watchPct > 0 : watched;
-const collectActive = isSeries ? collectionPct > 0 : inLibrary;
+const collectActive = isSeries ? collectionPct > 0 || collectedAsSeries : inLibrary;
+// A show collected as a whole (no episode rows) is in the library at 0%.
+const seriesInLibraryOnly = isSeries && collectedAsSeries && collectionPct === 0;
 ---
 
 <div class="grid grid-cols-3 flex-shrink-0">
@@ -56,7 +59,7 @@ const collectActive = isSeries ? collectionPct > 0 : inLibrary;
     data-in-library={String(inLibrary)}
     data-collection-pct={String(collectionPct)}
     data-state={collectActive ? 'active' : 'inactive'}
-    title={isSeries ? `${collectionPct}% in library` : (inLibrary ? 'Remove from collection' : 'Add to collection')}
+    title={seriesInLibraryOnly ? 'In library' : isSeries ? `${collectionPct}% in library` : (inLibrary ? 'Remove from collection' : 'Add to collection')}
     class={`flex flex-col items-center justify-center gap-1 py-2.5 transition-all cursor-pointer hover:brightness-125 ${collectActive ? 'bg-purple-500/20 text-purple-400' : 'bg-zinc-900 text-zinc-400 hover:bg-purple-500/10 hover:text-purple-400'}`}
   >
     <svg xmlns="http://www.w3.org/2000/svg" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -65,6 +68,6 @@ const collectActive = isSeries ? collectionPct > 0 : inLibrary;
       <path d="M15 22v-4a3 3 0 0 0-6 0v4"/>
       <path d="M2 7h20"/>
     </svg>
-    <span class="text-[8px] font-bold uppercase tracking-wider leading-none">{isSeries ? `${collectionPct}%` : 'Collected'}</span>
+    <span class="text-[8px] font-bold uppercase tracking-wider leading-none">{seriesInLibraryOnly ? '✓' : isSeries ? `${collectionPct}%` : 'Collected'}</span>
   </button>
 </div>

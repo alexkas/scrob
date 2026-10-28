@@ -239,6 +239,7 @@ export interface PersonCredit {
   in_lists?: number[];
   in_library?: boolean;
   collection_pct?: number;
+  collected_as_series?: boolean;
 }
 
 export interface PersonDetail {
@@ -747,6 +748,9 @@ export interface MediaItem {
   watched?: boolean;
   in_lists?: number[];
   collection_pct?: number;
+  // Series only: collected as a whole show (series-level entry, e.g. from
+  // Stremio) rather than episode by episode - in_library even at 0%.
+  collected_as_series?: boolean;
   watch_pct?: number;
   watch_started?: boolean;
   is_monitored?: boolean;
@@ -1059,6 +1063,7 @@ export interface Show {
   watch_started?: boolean;
   in_lists: number[];
   collection_pct: number;
+  collected_as_series?: boolean;
   is_monitored?: boolean;
   request_enabled?: boolean;
   seasons: Record<string, MediaItem[]>;
