@@ -167,7 +167,7 @@ class StremioSyncTests(unittest.IsolatedAsyncioTestCase):
             "get_cinemeta_series",
             AsyncMock(return_value={"videos": videos}),
         ):
-            library, watched_records, progress, removed = await _stremio_records([item])
+            library, watched_records, progress, clears, removed = await _stremio_records([item])
 
         self.assertEqual([record["content_id"] for record in library], ["tt0944947"])
         self.assertEqual(
@@ -191,7 +191,7 @@ class StremioSyncTests(unittest.IsolatedAsyncioTestCase):
             },
         }
 
-        library, watched_records, progress, removed = await _stremio_records([item])
+        library, watched_records, progress, clears, removed = await _stremio_records([item])
 
         self.assertEqual(library, [])
         self.assertEqual(
@@ -206,6 +206,7 @@ class StremioSyncTests(unittest.IsolatedAsyncioTestCase):
             ],
         )
         self.assertEqual(progress, [])
+        self.assertEqual([clear["content_id"] for clear in clears], ["tt0133093"])
         self.assertEqual(removed, {"tt0133093"})
 
     async def test_temporary_removed_series_still_emits_episode_state(self) -> None:
@@ -237,7 +238,7 @@ class StremioSyncTests(unittest.IsolatedAsyncioTestCase):
             "get_cinemeta_series",
             AsyncMock(return_value={"videos": videos}),
         ):
-            library, watched_records, progress, removed = await _stremio_records([item])
+            library, watched_records, progress, clears, removed = await _stremio_records([item])
 
         self.assertEqual(library, [])
         self.assertEqual(
@@ -282,7 +283,7 @@ class StremioSyncTests(unittest.IsolatedAsyncioTestCase):
             "get_cinemeta_series",
             AsyncMock(return_value={"videos": videos}),
         ) as get_series:
-            library, watched_records, progress, removed = await _stremio_records([item])
+            library, watched_records, progress, clears, removed = await _stremio_records([item])
 
         get_series.assert_awaited_once_with("tt34866681")
         self.assertEqual(library, [])
@@ -295,6 +296,104 @@ class StremioSyncTests(unittest.IsolatedAsyncioTestCase):
             [("tmdb:278624", 1, 2)],
         )
         self.assertEqual(removed, {"tmdb:278624"})
+
+    async def test_movie_reset_to_zero_emits_clear(self) -> None:
+        item = {
+            "_id": "tt0133093",
+            "type": "movie",
+            "name": "The Matrix",
+            "_mtime": "2026-08-01T10:00:00Z",
+            "state": {
+                "timeOffset": 0,
+                "duration": 8_160_000,
+                "lastWatched": "2026-07-31T20:00:00Z",
+            },
+        }
+
+        library, watched_records, progress, clears, removed = await _stremio_records([item])
+
+        self.assertEqual(progress, [])
+        self.assertEqual(
+            clears,
+            [
+                {
+                    "content_id": "tt0133093",
+                    "content_type": "movie",
+                    "title": "The Matrix",
+                    # The later of lastWatched and _mtime.
+                    "cleared_at": 1785578400000,
+                }
+            ],
+        )
+
+    async def test_movie_removed_from_library_emits_clear_despite_offset(self) -> None:
+        item = {
+            "_id": "tt0133093",
+            "type": "movie",
+            "name": "The Matrix",
+            "removed": True,
+            "state": {"timeOffset": 600_000, "duration": 8_160_000},
+        }
+
+        library, watched_records, progress, clears, removed = await _stremio_records([item])
+
+        self.assertEqual(progress, [])
+        self.assertEqual([clear["content_id"] for clear in clears], ["tt0133093"])
+        self.assertIsNone(clears[0]["cleared_at"])
+        self.assertEqual(removed, {"tt0133093"})
+
+    async def test_movie_in_continue_watching_emits_no_clear(self) -> None:
+        item = {
+            "_id": "tt0133093",
+            "type": "movie",
+            "name": "The Matrix",
+            "state": {"timeOffset": 600_000, "duration": 8_160_000},
+        }
+
+        library, watched_records, progress, clears, removed = await _stremio_records([item])
+
+        self.assertEqual(len(progress), 1)
+        self.assertEqual(clears, [])
+
+    async def test_series_in_continue_watching_keeps_only_current_episode(self) -> None:
+        videos = [
+            {"id": "tt0944947:1:3", "season": 1, "episode": 3},
+            {"id": "tt0944947:1:4", "season": 1, "episode": 4},
+        ]
+        item = {
+            "_id": "tt0944947",
+            "type": "series",
+            "name": "Game of Thrones",
+            "state": {
+                "video_id": "tt0944947:1:4",
+                "timeOffset": 120_000,
+                "duration": 3_600_000,
+                "lastWatched": "2026-07-26T12:00:00Z",
+            },
+        }
+
+        with patch.object(stremio, "get_cinemeta_series", AsyncMock(return_value={"videos": videos})):
+            library, watched_records, progress, clears, removed = await _stremio_records([item])
+
+        self.assertEqual([(record["season"], record["episode"]) for record in progress], [(1, 4)])
+        self.assertEqual(len(clears), 1)
+        self.assertEqual((clears[0]["keep_season"], clears[0]["keep_episode"]), (1, 4))
+
+    async def test_series_reset_to_zero_clears_whole_show(self) -> None:
+        videos = [{"id": "tt0944947:1:4", "season": 1, "episode": 4}]
+        item = {
+            "_id": "tt0944947",
+            "type": "series",
+            "name": "Game of Thrones",
+            "state": {"video_id": "tt0944947:1:4", "timeOffset": 0, "duration": 3_600_000},
+        }
+
+        with patch.object(stremio, "get_cinemeta_series", AsyncMock(return_value={"videos": videos})):
+            library, watched_records, progress, clears, removed = await _stremio_records([item])
+
+        self.assertEqual(progress, [])
+        self.assertEqual(len(clears), 1)
+        self.assertNotIn("keep_season", clears[0])
 
     def test_noop_comparison_ignores_only_mtime(self) -> None:
         left = {"_id": "tt0133093", "_mtime": "old", "state": {"timeOffset": 42}, "custom": True}

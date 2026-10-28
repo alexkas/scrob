@@ -5092,7 +5092,17 @@ def _stremio_series_imdb_id(item: dict) -> str | None:
 
 async def _stremio_records(
     items: list[dict],
-) -> tuple[list[dict], list[dict], list[dict], set[str]]:
+) -> tuple[list[dict], list[dict], list[dict], list[dict], set[str]]:
+    """Split Stremio library items into library, watched, progress and
+    progress-clear records plus the ids removed from the library.
+
+    Stremio shows an item in Continue Watching only while
+    `(!removed || temp) && timeOffset > 0`, and tracks a single `video_id`
+    per series. A clear record marks progress Scrob should drop because the
+    item left Continue Watching; a series clear with `keep_season` /
+    `keep_episode` drops every episode's progress except the current one.
+    `cleared_at` (epoch ms) is the item's latest Stremio timestamp, so
+    progress written after it by another source survives."""
     records = [
         item
         for item in items
@@ -5123,6 +5133,7 @@ async def _stremio_records(
     library_records: list[dict] = []
     watched_records: list[dict] = []
     progress_records: list[dict] = []
+    progress_clears: list[dict] = []
     for item in records:
         content_id = str(item["_id"])
         content_type = str(item["type"])
@@ -5136,6 +5147,21 @@ async def _stremio_records(
         if not item.get("removed") and not item.get("temp"):
             library_records.append(base)
         last_watched = _stremio_epoch_ms(state.get("lastWatched"))
+        stamps = [
+            stamp
+            for stamp in (last_watched, _stremio_epoch_ms(item.get("_mtime")))
+            if stamp is not None
+        ]
+        cleared_at = max(stamps) if stamps else None
+        # A temp item is a removed placeholder that still holds watch state,
+        # and Stremio keeps showing it in Continue Watching.
+        in_library_state = not item.get("removed") or bool(item.get("temp"))
+        try:
+            position = int(state.get("timeOffset") or 0)
+            duration = int(state.get("duration") or 0)
+        except (TypeError, ValueError):
+            position = duration = 0
+        in_continue_watching = in_library_state and position > 0
 
         if content_type == "movie":
             try:
@@ -5144,12 +5170,9 @@ async def _stremio_records(
                 times_watched = 0
             if times_watched > 0:
                 watched_records.append({**base, "watched_at": last_watched})
-            try:
-                position = int(state.get("timeOffset") or 0)
-                duration = int(state.get("duration") or 0)
-            except (TypeError, ValueError):
-                position = duration = 0
-            if position > 0 and duration > 0:
+            if not in_continue_watching:
+                progress_clears.append({**base, "cleared_at": cleared_at})
+            elif duration > 0:
                 progress_records.append(
                     {
                         **base,
@@ -5187,12 +5210,19 @@ async def _stremio_records(
             {"id": current_video_id},
         )
         current_parts = _stremio_video_parts(current_video)
-        try:
-            position = int(state.get("timeOffset") or 0)
-            duration = int(state.get("duration") or 0)
-        except (TypeError, ValueError):
-            position = duration = 0
-        if current_parts and position > 0 and duration > 0:
+        if not in_continue_watching:
+            progress_clears.append({**base, "cleared_at": cleared_at})
+        elif current_parts:
+            season, episode = current_parts
+            progress_clears.append(
+                {
+                    **base,
+                    "cleared_at": cleared_at,
+                    "keep_season": season,
+                    "keep_episode": episode,
+                }
+            )
+        if in_continue_watching and current_parts and duration > 0:
             season, episode = current_parts
             progress_records.append(
                 {
@@ -5205,7 +5235,99 @@ async def _stremio_records(
                     "last_watched": last_watched,
                 }
             )
-    return library_records, watched_records, progress_records, removed_ids
+    return library_records, watched_records, progress_records, progress_clears, removed_ids
+
+
+async def _apply_stremio_progress_clears(
+    db: AsyncSession,
+    user_id: int,
+    clears: list[dict],
+    show_map: dict[str, int],
+    tmdb_ids: dict[str, int],
+) -> int:
+    """Delete PlaybackProgress for items that left Stremio's Continue Watching.
+
+    Only touches media and shows Scrob already has - a clear never creates
+    anything. Returns the number of rows deleted."""
+    movie_clears: dict[int, list[dict]] = {}
+    series_clears: dict[int, list[dict]] = {}
+    for clear in clears:
+        tmdb_id = tmdb_ids.get(str(clear.get("content_id") or ""))
+        if tmdb_id is None:
+            continue
+        if str(clear.get("content_type") or "").lower() == "movie":
+            movie_clears.setdefault(tmdb_id, []).append(clear)
+        else:
+            series_clears.setdefault(tmdb_id, []).append(clear)
+
+    # Shows already synced this run are in show_map; a series that only
+    # produced a clear may not be, so look it up without fetching from TMDB.
+    show_ids_by_tmdb: dict[int, int] = {}
+    for content_id, show_id in show_map.items():
+        if (tmdb_id := tmdb_ids.get(content_id)) in series_clears:
+            show_ids_by_tmdb[tmdb_id] = show_id
+    missing_show_tmdb_ids = [tmdb_id for tmdb_id in series_clears if tmdb_id not in show_ids_by_tmdb]
+    if missing_show_tmdb_ids:
+        shows = await _select_in_chunks(
+            db,
+            lambda chunk: select(Show).where(Show.tmdb_id.in_(chunk)),
+            missing_show_tmdb_ids,
+        )
+        show_ids_by_tmdb.update({show.tmdb_id: show.id for show in shows if show.tmdb_id is not None})
+    clears_by_show = {
+        show_ids_by_tmdb[tmdb_id]: rows
+        for tmdb_id, rows in series_clears.items()
+        if tmdb_id in show_ids_by_tmdb
+    }
+
+    media_by_id: dict[int, Media] = {}
+    if movie_clears:
+        rows_found = await _select_in_chunks(
+            db,
+            lambda chunk: select(Media).where(Media.media_type == MediaType.movie, Media.tmdb_id.in_(chunk)),
+            list(movie_clears),
+        )
+        media_by_id.update({media.id: media for media in rows_found})
+    if clears_by_show:
+        rows_found = await _select_in_chunks(
+            db,
+            lambda chunk: select(Media).where(Media.media_type == MediaType.episode, Media.show_id.in_(chunk)),
+            list(clears_by_show),
+        )
+        media_by_id.update({media.id: media for media in rows_found})
+    if not media_by_id:
+        return 0
+    existing_rows = await _select_in_chunks(
+        db,
+        lambda chunk: select(PlaybackProgress).where(
+            PlaybackProgress.user_id == user_id,
+            PlaybackProgress.media_id.in_(chunk),
+        ),
+        list(media_by_id),
+    )
+    candidates = [(progress, media_by_id[progress.media_id]) for progress in existing_rows]
+
+    def clears_progress(clear: dict, progress: PlaybackProgress, media: Media) -> bool:
+        if (
+            "keep_season" in clear
+            and (media.season_number, media.episode_number) == (clear["keep_season"], clear["keep_episode"])
+        ):
+            return False
+        cleared_at = _nuvio_datetime(clear.get("cleared_at"))
+        return cleared_at is None or progress.updated_at <= cleared_at
+
+    deleted = 0
+    for progress, media in candidates:
+        if media.media_type == MediaType.movie:
+            rows = movie_clears.get(media.tmdb_id, [])
+        else:
+            rows = clears_by_show.get(media.show_id, [])
+        if any(clears_progress(clear, progress, media) for clear in rows):
+            await db.delete(progress)
+            deleted += 1
+    if deleted:
+        await db.commit()
+    return deleted
 
 
 async def _remove_stremio_collection_sources(
@@ -5332,7 +5454,13 @@ async def _run_stremio_sync(
                 conn,
                 full_resync=full_resync,
             )
-            library_records, watched_records, progress_records, removed_ids = await _stremio_records(items)
+            (
+                library_records,
+                watched_records,
+                progress_records,
+                progress_clears,
+                removed_ids,
+            ) = await _stremio_records(items)
             if not conn.sync_collection:
                 library_records = []
                 removed_ids = set()
@@ -5340,10 +5468,13 @@ async def _run_stremio_sync(
                 watched_records = []
             if not conn.sync_playback:
                 progress_records = []
+                progress_clears = []
 
+            # Clears stay out of all_records: they must not create shows or
+            # media, only resolve ids for rows Scrob already has.
             all_records = [*library_records, *watched_records, *progress_records]
             tmdb_ids = await _resolve_nuvio_tmdb_ids(
-                all_records,
+                [*all_records, *progress_clears],
                 db,
                 user_id,
                 tmdb_api_key,
@@ -5467,6 +5598,10 @@ async def _run_stremio_sync(
                 )
             if progress_records:
                 await _apply_nuvio_progress(db, user_id, progress_records, show_map, tmdb_ids)
+            # After the upserts, so a series' current episode is already
+            # written when its other episodes are cleared.
+            if progress_clears:
+                await _apply_stremio_progress_clears(db, user_id, progress_clears, show_map, tmdb_ids)
 
             complete_snapshot_ids = (
                 {str(record["content_id"]) for record in library_records}

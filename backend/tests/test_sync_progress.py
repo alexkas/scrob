@@ -1,5 +1,6 @@
 """Tests for sync progress counter fixes (#494, #497, #503)."""
 import os
+from datetime import datetime
 import unittest
 from unittest.mock import AsyncMock, patch
 
@@ -18,7 +19,14 @@ from models.events import WatchEvent
 from models.media import Media
 from models.show import Show
 from models.sync import SyncJob, SyncStatus
-from routers.sync import sync_items, _apply_nuvio_watch_history, _expand_multi_episode_items
+from models.playback_progress import PlaybackProgress
+from routers.sync import (
+    sync_items,
+    _apply_nuvio_progress,
+    _apply_nuvio_watch_history,
+    _apply_stremio_progress_clears,
+    _expand_multi_episode_items,
+)
 
 
 @compiles(JSONB, "sqlite")
@@ -103,6 +111,121 @@ class StremioWatchHistorySourceTests(_TestDB):
             )).scalars().all()
             self.assertEqual(len(events), 1)
             self.assertEqual(events[0].source, "stremio")
+
+
+class StremioProgressClearTests(_TestDB):
+    """Progress for items that left Stremio's Continue Watching is deleted on pull."""
+
+    async def _progress_media_ids(self, db) -> set[int]:
+        rows = (await db.execute(select(PlaybackProgress.media_id))).scalars().all()
+        return set(rows)
+
+    async def _add_progress(self, db, media: Media, updated_at: datetime) -> None:
+        db.add(PlaybackProgress(
+            user_id=1, media_id=media.id, progress_percent=0.4, progress_seconds=600, updated_at=updated_at,
+        ))
+
+    async def test_movie_clear_deletes_progress(self):
+        async with self.Session() as db:
+            movie = Media(tmdb_id=603, media_type=MediaType.movie, title="The Matrix")
+            db.add(movie)
+            await db.flush()
+            await self._add_progress(db, movie, datetime(2026, 7, 1))
+            await db.commit()
+
+            deleted = await _apply_stremio_progress_clears(
+                db, 1,
+                [{"content_id": "tt0133093", "content_type": "movie", "cleared_at": 1785528000000}],
+                {}, {"tt0133093": 603},
+            )
+
+            self.assertEqual(deleted, 1)
+            self.assertEqual(await self._progress_media_ids(db), set())
+
+    async def test_clear_keeps_progress_newer_than_stremio_state(self):
+        """A full resync must not wipe progress another source wrote later."""
+        async with self.Session() as db:
+            movie = Media(tmdb_id=603, media_type=MediaType.movie, title="The Matrix")
+            db.add(movie)
+            await db.flush()
+            await self._add_progress(db, movie, datetime(2026, 9, 1))
+            await db.commit()
+
+            deleted = await _apply_stremio_progress_clears(
+                db, 1,
+                # 2026-07-31T20:00:00Z
+                [{"content_id": "tt0133093", "content_type": "movie", "cleared_at": 1785528000000}],
+                {}, {"tt0133093": 603},
+            )
+
+            self.assertEqual(deleted, 0)
+            self.assertEqual(await self._progress_media_ids(db), {movie.id})
+
+    async def _show_with_episodes(self, db):
+        show = Show(tmdb_id=1399, title="Game of Thrones")
+        db.add(show)
+        await db.flush()
+        episodes = {
+            n: Media(media_type=MediaType.episode, title=f"S1E{n}", show_id=show.id, season_number=1, episode_number=n)
+            for n in (3, 4)
+        }
+        db.add_all(episodes.values())
+        await db.flush()
+        return show, episodes
+
+    async def test_new_current_episode_replaces_previous_one(self):
+        async with self.Session() as db:
+            show, episodes = await self._show_with_episodes(db)
+            await self._add_progress(db, episodes[3], datetime(2026, 7, 20))
+            await db.commit()
+
+            # Stremio moved on to S1E4: upsert it, then clear the rest of the show.
+            await _apply_nuvio_progress(
+                db, 1,
+                [{
+                    "content_id": "tt0944947", "content_type": "series", "season": 1, "episode": 4,
+                    "position": 1_200_000, "duration": 3_600_000, "last_watched": 1785067200000,
+                }],
+                {"tt0944947": show.id}, {"tt0944947": 1399},
+            )
+            await _apply_stremio_progress_clears(
+                db, 1,
+                [{
+                    "content_id": "tt0944947", "content_type": "series", "cleared_at": 1785067200000,
+                    "keep_season": 1, "keep_episode": 4,
+                }],
+                {"tt0944947": show.id}, {"tt0944947": 1399},
+            )
+
+            self.assertEqual(await self._progress_media_ids(db), {episodes[4].id})
+
+    async def test_series_clear_without_show_map_finds_existing_show(self):
+        """A clear-only series is never synced this run, so it isn't in show_map."""
+        async with self.Session() as db:
+            show, episodes = await self._show_with_episodes(db)
+            for episode in episodes.values():
+                await self._add_progress(db, episode, datetime(2026, 7, 20))
+            await db.commit()
+
+            deleted = await _apply_stremio_progress_clears(
+                db, 1,
+                [{"content_id": "tt0944947", "content_type": "series", "cleared_at": None}],
+                {}, {"tt0944947": 1399},
+            )
+
+            self.assertEqual(deleted, 2)
+            self.assertEqual(await self._progress_media_ids(db), set())
+
+    async def test_clear_for_unknown_show_creates_nothing(self):
+        async with self.Session() as db:
+            deleted = await _apply_stremio_progress_clears(
+                db, 1,
+                [{"content_id": "tt0944947", "content_type": "series", "cleared_at": None}],
+                {}, {"tt0944947": 1399},
+            )
+
+            self.assertEqual(deleted, 0)
+            self.assertEqual((await db.execute(select(Show))).scalars().all(), [])
 
 
 class SyncItemsBatchBoundarySkipTests(_TestDB):
